@@ -122,7 +122,7 @@ def _ck_nll_kernel(X, W16, TGT, LSE, NLL, n_rows, K, BM: tl.constexpr,
         w = tl.load(W16 + y_safe[:, None] * K + (k0 + oe)[None, :],
                     mask=ymask[:, None], other=0.0).to(tl.float32)
         acc += tl.sum(x * w, axis=1)
-    nll = tl.where(ymask, acc - tl.load(LSE + rows, mask=rmask, other=0.0), 0.0)
+    nll = tl.where(ymask, tl.load(LSE + rows, mask=rmask, other=0.0) - acc, 0.0)
     tl.store(NLL + rows, nll, mask=rmask)
 
 
@@ -149,7 +149,7 @@ def _ck_dlogits_kernel(X, W16, TGT, AM, LSE, ENT, DL, pstart, nrows,
         tgt = tl.load(TGT + rows, mask=rmask, other=-100)
         labelled = (tgt != -100) & rmask
         am = tl.load(AM + rows, mask=rmask, other=0.0)
-        contrib = tl.sum(p * (lg - lse[:, None]) * am[:, None], axis=1)
+        contrib = tl.sum(p * (lse[:, None] - lg) * am[:, None], axis=1)
         tl.atomic_add(ENT + rows, contrib, mask=rmask)
         onehot = (vw[None, :] == tgt[:, None]).to(tl.float32)
         d = tl.where(labelled[:, None], (p - onehot) * inv_den, 0.0)
