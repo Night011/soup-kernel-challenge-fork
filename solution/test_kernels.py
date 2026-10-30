@@ -4,7 +4,8 @@ Run on a GPU: `python -m pytest solution -q`.
 """
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
