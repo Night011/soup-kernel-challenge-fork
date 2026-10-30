@@ -32,6 +32,15 @@ _TRL_LOSS = None
 # ---------------------------------------------------------------------------
 
 def _trim_inputs(inputs):
+    try:
+        return _trim_inputs_inner(inputs)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return inputs
+
+
+def _trim_inputs_inner(inputs):
     if not isinstance(inputs, dict) or len(inputs) == 0:
         return inputs
     am = inputs.get("attention_mask")
@@ -89,6 +98,8 @@ def patch_trainer_prepare_inputs():
 
     prepared._ck_is_ours = True
     transformers.Trainer._prepare_inputs = prepared
+    print("[ck] patch prepare_inputs ok", flush=True)
+    return prepared
 
 
 # ---------------------------------------------------------------------------
@@ -181,10 +192,17 @@ def _ck_causal_forward(
     )
     hidden = outputs.last_hidden_state
     hook = _ACTIVE
-    loss, step = ck_head.ck_chunked_lm_loss(
-        hidden, labels, self.lm_head.weight, attention_mask,
-        num_items_in_batch, hook,
-    )
+    try:
+        loss, step = ck_head.ck_chunked_lm_loss(
+            hidden, labels, self.lm_head.weight, attention_mask,
+            num_items_in_batch, hook,
+        )
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print("[ck] chunked head failed: falling back to stock logits path",
+              flush=True)
+        loss, step = None, None
     if loss is None:  # our guards said no: stock logits path, stock metrics
         logits = self.lm_head(hidden)
         loss = self.loss_function(
@@ -208,29 +226,40 @@ def engage(model):
     """Install the instance forward + hook for the challenge flow, else None."""
     global _ACTIVE
     disengage()
+    print("[ck] engage: begin", flush=True)
     if not torch.cuda.is_available():
+        print("[ck] engage: skip (no cuda)", flush=True)
         return None
     try:
         from . import ck_head
 
         lm = _causal_lm_of(model)
         if lm is None:
+            print("[ck] engage: skip (no causal lm)", flush=True)
             return None
         cfg = lm.config
         if getattr(cfg, "model_type", "") != "qwen2":
+            print(f"[ck] engage: skip (model_type={getattr(cfg, 'model_type', None)})"
+                  , flush=True)
             return None
         w = lm.lm_head.weight
         if not (w.is_cuda and w.dtype == torch.float32 and not w.requires_grad):
+            print(f"[ck] engage: skip (head {w.dtype}, cuda={w.is_cuda}, "
+                  f"requires_grad={w.requires_grad})", flush=True)
             return None
         if cfg.vocab_size % 128 != 0 or cfg.hidden_size % 64 != 0:
+            print("[ck] engage: skip (V%128 or K%64)", flush=True)
             return None
         hook = ck_head.CKHeadHook()
         hook.causal_lm = lm
         hook.orig_forward = lm.forward
         lm.forward = types.MethodType(_ck_causal_forward, lm)
         _ACTIVE = hook
+        print("[ck] engage: OK", flush=True)
         return hook
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -300,6 +329,7 @@ def patch_trl_compute_loss():
     patched = _ck_sft_compute_loss
     patched._ck_is_ours = True
     trl.SFTTrainer.compute_loss = patched
+    print("[ck] patch trl compute_loss ok", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -319,11 +349,13 @@ def wrap_setup_transformers():
         try:
             engage(self.model)
         except Exception:
-            pass
+            import traceback
+            traceback.print_exc()
         return out
 
     hooked._ck_is_ours = True
     cls._setup_transformers = hooked
+    print("[ck] patch setup_transformers ok", flush=True)
 
 
 def apply_all():

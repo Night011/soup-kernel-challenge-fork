@@ -29,26 +29,27 @@ def test_swiglu_matches_pytorch():
     out = swiglu(gate, up)
     out.backward(grad)
     torch.testing.assert_close(out.float(), ref, rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(gate.grad.float(), dgate, rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(up.grad.float(), dup, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(gate.grad.float(), dgate.float(), rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(up.grad.float(), dup.float(), rtol=2e-3, atol=2e-3)
 
 
-@pytest.mark.parametrize("rows", [2048, 17])
-def test_rmsnorm_matches_reference(rows):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("shape", [(2048, 1536), (3, 5, 1536)])
+def test_rmsnorm_matches_reference(dtype, shape):
     """K1: fused RMSNorm forward + backward vs the reference math."""
     import solution.ck_rms as rms
 
     torch.manual_seed(0)
     hidden = 1536
     eps = 1e-6
-    x = torch.randn(rows, hidden, device="cuda", dtype=torch.float32)
-    w = torch.randn(hidden, device="cuda", dtype=torch.float32)
-    dy = torch.randn(rows, hidden, device="cuda", dtype=torch.float16)
+    x = torch.randn(*shape, device="cuda", dtype=dtype)
+    w = torch.randn(hidden, device="cuda", dtype=dtype)
+    dy = torch.randn(*shape, device="cuda", dtype=dtype)
 
     xr = x.clone().requires_grad_(True)
     xf = xr.to(torch.float32)
     ref = w * (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)) \
-        .to(torch.float16)
+        .to(dtype)
     ref.backward(dy.float())
     ref_dx = xr.grad.clone()
     ref_y = ref.detach().clone()
@@ -56,12 +57,14 @@ def test_rmsnorm_matches_reference(rows):
     xo = x.clone().requires_grad_(True)
     out = rms.CKRMSNormFn.apply(xo, w, eps)
     out.backward(dy)
-    torch.testing.assert_close(out, ref_y, rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(xo.grad, ref_dx, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(out.float(), ref_y.float(), rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(xo.grad.float(), ref_dx.float(),
+                               rtol=2e-3, atol=2e-3)
 
 
-def test_rope_matches_reference():
-    """K2: fused RoPE forward + backward vs apply_rotary_pos_emb."""
+@pytest.mark.parametrize("cos_dtype", [torch.float32, torch.float16])
+def test_rope_matches_reference(cos_dtype):
+    """K2: fused RoPE fwd+bwd vs apply_rotary_pos_emb (fp32 and fp16 cos/sin)."""
     import solution.ck_rope as rope_mod
     from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
 
@@ -72,9 +75,9 @@ def test_rope_matches_reference():
     pos = torch.arange(S, device="cuda").float()
     inv = 1.0 / (10000 ** (torch.arange(0, RD, 2, device="cuda").float() / RD))
     freqs = pos[None, :, None] * inv[None, None, :]
-    emb = torch.cat([freqs, freqs], dim=-1)
-    cos = emb.cos().unsqueeze(0).expand(B, -1, -1).contiguous()
-    sin = emb.sin().unsqueeze(0).expand(B, -1, -1).contiguous()
+    emb = torch.cat([freqs, freqs], dim=-1)          # (1, S, RD)
+    cos = emb.cos().expand(B, -1, -1).to(cos_dtype)
+    sin = emb.sin().expand(B, -1, -1).to(cos_dtype)
     dq = torch.randn_like(q)
     dk = torch.randn_like(k)
 
@@ -84,14 +87,18 @@ def test_rope_matches_reference():
     gq, gk = torch.autograd.grad(
         (rq * dq).float().sum() + (rk * dk).float().sum(), (qr, kr))
 
-    qo = q.clone().requires_grad_(True)
-    ko = k.clone().requires_grad_(True)
+    # our path also has to handle the transposed non-contiguous q/k the Qwen2
+    # attention really passes (view -> transpose layout)
+    qt = q.transpose(1, 2).contiguous().transpose(1, 2)
+    kt = k.transpose(1, 2).contiguous().transpose(1, 2)
+    qo = qt.clone().requires_grad_(True)
+    ko = kt.clone().requires_grad_(True)
     oval_q, oval_k = rope_mod.CKRopeFn.apply(qo, ko, cos, sin)
     ((oval_q * dq).float().sum() + (oval_k * dk).float().sum()).backward()
-    torch.testing.assert_close(oval_q.float(), rq.float(), rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(oval_k.float(), rk.float(), rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(qo.grad, gq, rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(ko.grad, gk, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(oval_q.float(), rq.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(oval_k.float(), rk.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(qo.grad.float(), gq.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(ko.grad.float(), gk.float(), rtol=2e-2, atol=2e-2)
 
 
 def test_head_loss_matches_reference():

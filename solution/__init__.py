@@ -17,7 +17,21 @@ from . import integrate
 
 
 def apply():
-    patch_qwen2_mlp()  # the example: works out of the box, does not count
-    patch_qwen2_rmsnorm()
-    patch_qwen2_rope()
-    integrate.apply_all()
+    """Ordered wiring; never raises — a failed patch prints and falls back to stock."""
+    import traceback
+
+    print("[ck] apply: begin", flush=True)
+    for label, fn in (
+        ("swiglu", patch_qwen2_mlp),
+        ("rmsnorm", patch_qwen2_rmsnorm),
+        ("rope", patch_qwen2_rope),
+        ("integrate", integrate.apply_all),
+    ):
+        try:
+            fn()
+            print(f"[ck] apply: {label} ok", flush=True)
+        except Exception:
+            traceback.print_exc()
+            print(f"[ck] apply: {label} FAILED (stock path stays in place)",
+                  flush=True)
+    print("[ck] apply: done", flush=True)
