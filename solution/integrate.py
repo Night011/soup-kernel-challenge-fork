@@ -203,6 +203,7 @@ def _ck_causal_forward(
         print("[ck] chunked head failed: falling back to stock logits path",
               flush=True)
         loss, step = None, None
+    logits = None
     if loss is None:  # our guards said no: stock logits path, stock metrics
         logits = self.lm_head(hidden)
         loss = self.loss_function(
@@ -213,7 +214,9 @@ def _ck_causal_forward(
         step = None
     out = CausalLMOutputWithPast(
         loss=loss,
-        logits=None,
+        # the stock fallback keeps real logits: Soup's rewind recorder prefers
+        # them over the chunked step, exactly like an unpatched run
+        logits=logits,
         past_key_values=getattr(outputs, "past_key_values", None),
         hidden_states=None,
         attentions=None,
@@ -299,9 +302,22 @@ def _ck_sft_compute_loss(self, model, inputs, return_outputs=False,
     hook.trainer = self
     inputs.pop("_prediction_loss_only", None)
     inputs["use_cache"] = False
-    loss = Trainer.compute_loss(
-        self, model, inputs, num_items_in_batch=num_items_in_batch
+    # same call Soup's own ChunkedLossTrainer makes (#1693)
+    loss, outputs = Trainer.compute_loss(
+        self, model, inputs, return_outputs=True,
+        num_items_in_batch=num_items_in_batch,
     )
+    # publish this micro-batch's per-token losses for Soup's rewind recorder;
+    # entropy/accuracy are appended by CKHeadHook.on_backward_done (they are
+    # produced by the gradient sweep, i.e. after this call)
+    step = hook.take_step()
+    step_attr = "_soup_chunked_step"
+    try:
+        from soup_cli.utils.stream_loss_chunk import STEP_ATTR
+        step_attr = STEP_ATTR
+    except Exception:
+        pass
+    setattr(self, step_attr, step)
     if "attention_mask" in inputs:
         num_tokens_in_batch = self.accelerator.gather_for_metrics(
             inputs["attention_mask"].sum()
@@ -315,7 +331,7 @@ def _ck_sft_compute_loss(self, model, inputs, return_outputs=False,
     self._total_train_tokens += num_tokens_in_batch
     self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
     if return_outputs:
-        return (loss, None)
+        return (loss, outputs)
     return loss
 
 

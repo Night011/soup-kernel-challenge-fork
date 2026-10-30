@@ -88,12 +88,15 @@ def test_rope_matches_reference(cos_dtype):
         (rq * dq).float().sum() + (rk * dk).float().sum(), (qr, kr))
 
     # our path also has to handle the transposed non-contiguous q/k the Qwen2
-    # attention really passes (view -> transpose layout)
+    # attention really passes (view -> transpose layout), through the public
+    # guard — q has 14 heads, k has 2 (GQA), which must not disable the kernel
     qt = q.transpose(1, 2).contiguous().transpose(1, 2)
     kt = k.transpose(1, 2).contiguous().transpose(1, 2)
     qo = qt.clone().requires_grad_(True)
     ko = kt.clone().requires_grad_(True)
-    oval_q, oval_k = rope_mod.CKRopeFn.apply(qo, ko, cos, sin)
+    out = rope_mod.ck_rope(qo, ko, cos, sin)
+    assert out is not None, "the real GQA shapes must engage the rope kernel"
+    oval_q, oval_k = out
     ((oval_q * dq).float().sum() + (oval_k * dk).float().sum()).backward()
     torch.testing.assert_close(oval_q.float(), rq.float(), rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(oval_k.float(), rk.float(), rtol=2e-2, atol=2e-2)
@@ -172,9 +175,10 @@ def test_prepare_inputs_trim():
 
 
 def test_smoke_full_qwen2_flow():
-    """End-to-end: tiny Qwen2 in the Soup-T4 layout (fp16 body, fp32 frozen lm_head),
-    our patches installed, forward+backward through the chunked head, all grads sane.
-    Catches integration breaks locally before any full `soup train` run."""
+    """End-to-end: tiny Qwen2 in the Soup-T4 layout (fp32 body from
+    `prepare_model_for_kbit_training`, fp16 autocast compute, fp32 frozen
+    lm_head), our patches installed, forward+backward through the chunked head,
+    all grads sane. Catches integration breaks before a full `soup train` run."""
     import solution
     from solution import integrate
     from transformers import AutoConfig, Qwen2ForCausalLM
@@ -192,9 +196,11 @@ def test_smoke_full_qwen2_flow():
         num_key_value_heads=1,
         max_position_embeddings=128,
     )
-    model = Qwen2ForCausalLM(cfg).cuda().to(torch.float16)
-    # the bnb-4bit flow keeps lm_head unquantized and stored in fp32, frozen
-    model.lm_head.weight.data = model.lm_head.weight.data.float()
+    model = Qwen2ForCausalLM(cfg).cuda()
+    # the kbit flow: body frozen and upcast to fp32, lm_head fp32 and frozen
+    for p in model.parameters():
+        p.requires_grad_(False)
+    model.model.embed_tokens.weight.requires_grad_(True)  # stand-in for LoRA
     model.lm_head.weight.requires_grad_(False)
 
     hook = integrate.engage(model)
@@ -210,8 +216,9 @@ def test_smoke_full_qwen2_flow():
         labels[am == 0] = -100
         labels[:, 0] = -100
 
-        out = model(input_ids=ids, attention_mask=am, labels=labels,
-                    use_cache=False)
+        with torch.autocast("cuda", dtype=torch.float16):
+            out = model(input_ids=ids, attention_mask=am, labels=labels,
+                        use_cache=False)
         assert out.loss is not None
         assert out.logits is None, "chunked head must own the forward"
         loss_v = float(out.loss.detach().item())
@@ -229,9 +236,46 @@ def test_smoke_full_qwen2_flow():
         labels2 = torch.randint(0, 512, (B, S), device="cuda")
         labels2[am == 0] = -100
         labels2[:, 0] = -100
-        out2 = model(input_ids=ids, attention_mask=am, labels=labels2,
-                     use_cache=False)
+        with torch.autocast("cuda", dtype=torch.float16):
+            out2 = model(input_ids=ids, attention_mask=am, labels=labels2,
+                         use_cache=False)
         out2.loss.backward()
         assert float(out2.loss.detach().item()) == float(out2.loss.detach().item())
     finally:
         integrate.disengage()
+
+
+def test_head_real_geometry():
+    """K3 at the exact challenge geometry (V=151936, K=1536, 4x512 tokens), which
+    is where a full-length vocab tile (NT=1187) first runs. Catches head-path
+    breakage in ~10 s instead of a full train roundtrip."""
+    import solution.ck_head as head
+
+    torch.manual_seed(0)
+    B, S, K, V = 4, 512, 1536, 151936
+    # the real flow: peft's kbit preparation upcasts the body (and the last
+    # hidden state) to fp32, so the head really gets an fp32 X
+    hidden = torch.randn(B, S, K, device="cuda", dtype=torch.float32,
+                         requires_grad=True)
+    weights = torch.randn(V, K, device="cuda", dtype=torch.float32)
+    am = torch.ones(B, S, dtype=torch.long, device="cuda")
+    am[:, 300:] = 0                      # long right padding, like the task
+    labels = torch.full((B, S), -100, dtype=torch.long, device="cuda")
+    # completion-only loss: only the tail of each row is supervised
+    for b in range(B):
+        lo = 100 + b
+        hi = 250 + b
+        labels[b, lo:hi] = torch.randint(0, V, (hi - lo,), device="cuda")
+    num_items = torch.tensor(int((labels[:, 1:] != -100).sum()),
+                             device="cuda", dtype=torch.long)
+
+    hook = head.CKHeadHook()
+    loss, step = head.ck_chunked_lm_loss(hidden, labels, weights, am,
+                                         num_items, hook)
+    assert loss is not None, "real geometry must engage the chunked head"
+    loss.backward()
+    assert torch.isfinite(loss).all()
+    assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+    assert float(hidden.grad.abs().sum().item()) > 0
+    assert step is not None and step.token_loss.shape == (B, S)
+    assert torch.isfinite(step.token_loss).all()

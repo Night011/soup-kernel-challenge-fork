@@ -7,7 +7,7 @@ with an autograd pair backed by two ``@triton.jit`` kernels:
   ``weight * x * rsqrt(mean(x^2) + eps)`` product, emitted directly in fp16 so
   the downstream projections see exactly the values the fp16 autocast cast of
   the fp32 reference output would produce (residual stream stays fp32).
-* ``_ck_rms_bwd``  — ``dx_k = r*w_k*dy_k - (2 r^3 / H) * x_k * sum_d(w_d*dy_d*x_d)``
+* ``_ck_rms_bwd``  — ``dx_k = r*w_k*dy_k - (r^3 / H) * x_k * sum_d(w_d*dy_d*x_d)``
   with ``r = rsqrt(mean(x^2)+eps)`` recomputed from the saved input.
 
 Guards: CUDA only, contiguous input in fp16/fp32 (the Soup T4 flow has an fp16
@@ -59,7 +59,9 @@ def _ck_rms_bwd_kernel(X, DY, W, DX, eps, H: tl.constexpr, BLOCK: tl.constexpr):
     m = tl.sum(acc_xx, axis=0) / H
     s = tl.sum(acc_gx, axis=0)
     r = tl.rsqrt(m + eps)
-    coef = 2.0 * r * r * r / H
+    # d/dx_j [ x_j * r(x) ] = r - x_j * (r^3 / H) * (2 x_j ... ) -- the exact
+    # derivative of r = (mean(x^2)+eps)^-1/2 is -(r^3 / H) * x_j.
+    coef = r * r * r / H
     for i in tl.static_range(H // BLOCK):
         d = i * BLOCK + offs
         x = tl.load(X + base + d).to(tl.float32)
