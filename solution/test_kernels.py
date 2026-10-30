@@ -169,3 +169,69 @@ def test_prepare_inputs_trim():
                        torch.arange(0, 5, device="cuda"))
     assert torch.equal(out["labels"], labels[:, 0:5])
     assert torch.equal(out["attention_mask"], am[:, 0:5])
+
+
+def test_smoke_full_qwen2_flow():
+    """End-to-end: tiny Qwen2 in the Soup-T4 layout (fp16 body, fp32 frozen lm_head),
+    our patches installed, forward+backward through the chunked head, all grads sane.
+    Catches integration breaks locally before any full `soup train` run."""
+    import solution
+    from solution import integrate
+    from transformers import AutoConfig, Qwen2ForCausalLM
+
+    solution.apply()  # same wiring as harness/_train.py: example + K1..K4
+
+    torch.manual_seed(0)
+    cfg = AutoConfig.for_model(
+        "qwen2",
+        vocab_size=512,  # % 128 == 0
+        hidden_size=256,  # % 64 == 0, head_dim = 128
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+    )
+    model = Qwen2ForCausalLM(cfg).cuda().to(torch.float16)
+    # the bnb-4bit flow keeps lm_head unquantized and stored in fp32, frozen
+    model.lm_head.weight.data = model.lm_head.weight.data.float()
+    model.lm_head.weight.requires_grad_(False)
+
+    hook = integrate.engage(model)
+    assert hook is not None, "engage must hook the tiny Qwen2 instance"
+
+    try:
+        B, S = 2, 12
+        am = torch.ones(B, S, dtype=torch.long, device="cuda")
+        am[:, -3:] = 0
+        am[1, :1] = 0
+        ids = torch.randint(0, 512, (B, S), device="cuda")
+        labels = torch.randint(0, 512, (B, S), device="cuda")
+        labels[am == 0] = -100
+        labels[:, 0] = -100
+
+        out = model(input_ids=ids, attention_mask=am, labels=labels,
+                    use_cache=False)
+        assert out.loss is not None
+        assert out.logits is None, "chunked head must own the forward"
+        loss_v = float(out.loss.detach().item())
+        assert 0.0 < loss_v < 100.0 and loss_v == loss_v  # finite, positive-ish
+
+        out.loss.backward()
+        emb_grad = model.model.embed_tokens.weight.grad
+        assert emb_grad is not None and emb_grad.abs().sum().item() > 0
+        assert torch.isfinite(emb_grad).all()
+        assert model.lm_head.weight.grad is None  # frozen head
+        assert hook.step is not None and hook.step.token_loss.dim() == 2
+
+        # second step (fresh grad graph, the cache path stays sane)
+        model.zero_grad(set_to_none=True)
+        labels2 = torch.randint(0, 512, (B, S), device="cuda")
+        labels2[am == 0] = -100
+        labels2[:, 0] = -100
+        out2 = model(input_ids=ids, attention_mask=am, labels=labels2,
+                     use_cache=False)
+        out2.loss.backward()
+        assert float(out2.loss.detach().item()) == float(out2.loss.detach().item())
+    finally:
+        integrate.disengage()
