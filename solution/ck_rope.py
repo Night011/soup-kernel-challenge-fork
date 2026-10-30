@@ -59,11 +59,13 @@ def _ck_rope_bwd_kernel(DX, COS, SIN, GX, S, H, RD: tl.constexpr, BR: tl.constex
 
 
 def _rope_one(x, cos, sin, back, grad=None):
-    """x: (B, H, S, RD) fp16 contiguous; cos/sin: (B, S, RD) fp32 contiguous."""
+    """x: (B, H, S, RD) fp16 (made contiguous); cos/sin: (B, S, RD) fp32 or fp16."""
     B, H, S, RD = x.shape
-    out = torch.empty_like(x)
-    grid = (B * H, (S + _ROPE_ROWS - 1) // _ROPE_ROWS)
     src = grad if back else x
+    if not src.is_contiguous():
+        src = src.contiguous()
+    out = torch.empty_like(src)
+    grid = (B * H, (S + _ROPE_ROWS - 1) // _ROPE_ROWS)
     kern = _ck_rope_bwd_kernel if back else _ck_rope_fwd_kernel
     kern[grid](src, cos, sin, out, S, H, RD=RD, BR=_ROPE_ROWS, num_warps=4)
     return out
@@ -85,16 +87,35 @@ class CKRopeFn(torch.autograd.Function):
         return gx_q, gx_k, None, None
 
 
+def _rope_cos3(cos):
+    """Callers usually pass (B, S, RD); accept an optional (B, 1, S, RD) too."""
+    if cos.dim() == 3:
+        return cos
+    if cos.dim() == 4 and cos.shape[1] == 1:
+        return cos[:, 0]
+    return None
+
+
 def ck_rope(q, k, cos, sin):
-    if not (q.is_cuda and q.dtype == torch.float16 and cos.dtype == torch.float32):
+    if not (q.is_cuda and q.dtype == torch.float16 and k.dtype == torch.float16):
         return None
-    if q.dim() != 4 or cos.dim() != 3 or cos.shape[-1] != q.shape[-1]:
+    if q.dim() != 4 or q.shape != k.shape:
         return None
-    if not (q.is_contiguous() and k.is_contiguous() and cos.is_contiguous() and sin.is_contiguous()):
+    cos, sin = _rope_cos3(cos), _rope_cos3(sin)
+    if cos is None or sin is None or cos.dtype != sin.dtype:
+        return None
+    if cos.dtype not in (torch.float16, torch.float32):
+        return None
+    if cos.shape[0] != q.shape[0] or cos.shape[1] != q.shape[2] \
+            or cos.shape[-1] != q.shape[-1] or cos.shape != sin.shape:
         return None
     rd = q.shape[-1]
     if rd % 64 != 0:
         return None
+    if not cos.is_contiguous():
+        cos = cos.contiguous()
+    if not sin.is_contiguous():
+        sin = sin.contiguous()
     return CKRopeFn.apply(q, k, cos, sin)
 
 
@@ -106,7 +127,12 @@ def patch_qwen2_rope():
         return
 
     def patched(q, k, cos, sin, unsqueeze_dim=1):
-        out = ck_rope(q, k, cos, sin)
+        try:
+            out = ck_rope(q, k, cos, sin)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            out = None
         if out is not None:
             return out
         return orig(q, k, cos, sin, unsqueeze_dim)

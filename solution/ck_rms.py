@@ -10,8 +10,10 @@ with an autograd pair backed by two ``@triton.jit`` kernels:
 * ``_ck_rms_bwd``  — ``dx_k = r*w_k*dy_k - (2 r^3 / H) * x_k * sum_d(w_d*dy_d*x_d)``
   with ``r = rsqrt(mean(x^2)+eps)`` recomputed from the saved input.
 
-Guards: CUDA only, fp32 input, fp32 frozen weight, hidden size divisible by
-the kernel tile — otherwise the original forward is used unchanged.
+Guards: CUDA only, contiguous input in fp16/fp32 (the Soup T4 flow has an fp16
+residual stream with an fp16 weight — fp32 straight-loading is also accepted),
+frozen weight, hidden size divisible by the kernel tile — otherwise the
+original forward is used unchanged.
 """
 
 import torch
@@ -37,7 +39,7 @@ def _ck_rms_fwd_kernel(X, W, Y, eps, H: tl.constexpr, BLOCK: tl.constexpr):
         x = tl.load(X + base + d).to(tl.float32)
         w = tl.load(W + d).to(tl.float32)
         y = w * (x * r)
-        tl.store(Y + base + d, y.to(tl.float16))
+        tl.store(Y + base + d, y.to(Y.dtype.element_ty))
 
 
 @triton.jit
@@ -64,23 +66,23 @@ def _ck_rms_bwd_kernel(X, DY, W, DX, eps, H: tl.constexpr, BLOCK: tl.constexpr):
         dy = tl.load(DY + base + d).to(tl.float32)
         w = tl.load(W + d).to(tl.float32)
         dx = r * w * dy - coef * x * s
-        tl.store(DX + base + d, dx)
+        tl.store(DX + base + d, dx.to(DX.dtype.element_ty))
 
 
 class CKRMSNormFn(torch.autograd.Function):
-    """y = w * x * rsqrt(mean(x^2)+eps); forward emits fp16, backward emits fp32."""
+    """y = w * x * rsqrt(mean(x^2)+eps); output in the input's dtype, backward dx same."""
 
     @staticmethod
     def forward(ctx, x, weight, eps):
         rows = x.numel() // weight.numel()
         hidden = weight.numel()
-        y = torch.empty(rows, hidden, dtype=torch.float16, device=x.device)
+        y = torch.empty_like(x).view(rows, hidden)
         _ck_rms_fwd_kernel[(rows,)](
             x, weight, y, eps, H=hidden, BLOCK=_RMS_BLOCK, num_warps=4, num_stages=2
         )
         ctx.save_for_backward(x, weight)
         ctx.eps = eps
-        return y
+        return y.view_as(x)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -98,12 +100,16 @@ class CKRMSNormFn(torch.autograd.Function):
 
 def ck_rmsnorm(x, weight, eps):
     """Triton path when it applies (returns tensor), else None."""
-    if not (x.is_cuda and x.dtype == torch.float32 and weight.dtype == torch.float32):
+    if not x.is_cuda or not x.is_contiguous():
         return None
-    if not (x.is_contiguous() and weight.is_contiguous()):
+    if x.dtype not in (torch.float16, torch.float32):
         return None
     hidden = weight.numel()
+    if weight.dtype not in (torch.float16, torch.float32):
+        return None
     if hidden != x.shape[-1] or hidden % _RMS_BLOCK != 0 or weight.requires_grad:
+        return None
+    if not weight.is_contiguous():
         return None
     return CKRMSNormFn.apply(x, weight, eps)
 
