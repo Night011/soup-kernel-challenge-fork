@@ -193,6 +193,11 @@ class CKHeadHook:
         self.trainer = None
         self.step = None
 
+    def take_step(self):
+        """The chunked step of the last labelled forward, once (Soup's protocol)."""
+        step, self.step = self.step, None
+        return step
+
     def store_step(self, trainer, chunked):
         try:
             from soup_cli.utils.stream_loss_chunk import STEP_ATTR
@@ -231,6 +236,10 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
         hidden = hidden.contiguous()
     npos = B * S
     X = hidden.view(npos, K)
+    if X.dtype != torch.float16:
+        # the kbit preparation upcasts the body to fp32; autocast feeds the
+        # head matmul an fp16 copy, and so do we (gradient flows via the cast)
+        X = X.to(torch.float16)
     labels_flat = labels.reshape(-1)
     tgt = torch.empty(npos, dtype=torch.int32, device=hidden.device)
     tgt[:-1] = labels_flat[1:]
@@ -313,7 +322,7 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
             acc = float(((amax_b == tgt_b) & lab).sum().item()) / total \
                 if total > 0 else 0.0
             hook.on_backward_done(hook.trainer, ent_mean, acc)
-            return dH, None, None, None, None, None, None
+            return dH, None, None, None, None
 
     loss = _CKHeadFn.apply(X, tgt, am, w16, piece_starts)
     if hook.step is None:
