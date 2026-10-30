@@ -1,0 +1,321 @@
+"""K3 — our own chunked fused lm_head + CE + entropy + accuracy (Triton).
+
+The reference path materializes a full fp16 logits tensor (4 x 512 x 151936)
+plus fp32 copies for log_softmax / cross-entropy / entropy — a few GB of
+transient buffers per step. We never materialize full logits.
+
+Per forward step (B*S' rows, vocab V, hidden K):
+
+1. ``_ck_cast_kernel``       — frozen fp32 lm_head weight -> cached fp16 copy
+                               (values are bit-identical to the autocast-cast
+                               weight the fp16 reference matmul uses).
+2. ``_ck_lse_fwd_kernel``    — tiled Triton GEMM X(rows,K) @ W16(K,V): rows are
+                               processed in 256-row pieces, vocab in 128-wide
+                               tiles; each program keeps a 128-row block and
+                               stores pmax/psum/pidx partials.
+3. ``_ck_lse_reduce_kernel`` — merges partials into per-row logsumexp and a
+                               first-wins argmax.
+4. ``_ck_nll_kernel``        — logit_y = sum_k X[r,k] * W16[y_r,k] gathered dot
+                               (exact fp16 products, fp32 sums, the same value
+                               tensor cores produce) -> nll = logit_y - lse.
+5. ``_ck_dlogits_kernel``    — second GEMM sweep: per piece, recompute tile
+                               logits, exp(logit-lse), store the fp16 dlogits
+                               tile ((p - onehot)/den, zeros at ignored rows)
+                               and atomic-add the token entropy (p * log p).
+``dH = dlogits_piece @ W16`` stays a plain fp16 cuBLAS matmul, piece by piece,
+so piece state is freed immediately.
+
+den is the cross-entropy denominator the Trainer already computes
+(num_items_in_batch), so loss value and every gradient scale match the
+reference exactly. Per-token losses are exposed through a CKHeadStep so the
+rewind recorder can produce row losses without logits.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+_BM = 128   # GEMM row block
+_BN = 128   # vocab tile
+_BK = 64    # hidden tile
+_CH = 256   # rows per piece (two _BM row blocks)
+
+_W16 = {"key": None, "tensor": None}
+
+
+@triton.jit
+def _ck_cast_kernel(SRC, DST, n, BLOCK: tl.constexpr):
+    i = tl.program_id(0).to(tl.int64) * BLOCK
+    o = i + tl.arange(0, BLOCK)
+    m = o < n
+    tmp = tl.load(SRC + o, mask=m, other=0.0)
+    tl.store(DST + o, tmp.to(tl.float16), mask=m)
+
+
+@triton.jit
+def _ck_lse_fwd_kernel(X, W16, STARTS, PMAX, PSUM, PIDX, K, NT,
+                       MB: tl.constexpr, BM: tl.constexpr,
+                       BN: tl.constexpr, BK: tl.constexpr):
+    pid0 = tl.program_id(0)      # piece
+    nt = tl.program_id(1)        # vocab tile
+    pw = tl.load(STARTS + pid0).to(tl.int32)
+    pe = tl.load(STARTS + pid0 + 1).to(tl.int32)
+    vw = nt * BN + tl.arange(0, BN)
+    for mb in tl.static_range(MB):
+        rows = pw + mb * BM + tl.arange(0, BM)
+        rmask = rows < pe
+        oe = tl.arange(0, BK)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            x = tl.load(X + rows[:, None] * K + (k0 + oe)[None, :],
+                        mask=rmask[:, None], other=0.0)
+            w = tl.load(W16 + vw[:, None] * K + (k0 + oe)[None, :])
+            acc = tl.dot(x, tl.trans(w), acc)
+        lg = acc.to(tl.float16).to(tl.float32)   # same rounding as fp16 logits
+        tmax = tl.max(lg, axis=1)
+        tsum = tl.sum(tl.exp(lg - tmax[:, None]), axis=1)
+        lam = tl.argmax(lg, axis=1).to(tl.int32) + nt * BN
+        tmax = tl.where(rmask, tmax, float("-inf"))
+        tsum = tl.where(rmask, tsum, 0.0)
+        grow = (pid0 * MB + mb) * BM + tl.arange(0, BM)
+        tl.store(PMAX + grow * NT + nt, tmax, mask=rmask)
+        tl.store(PSUM + grow * NT + nt, tsum, mask=rmask)
+        tl.store(PIDX + grow * NT + nt, lam, mask=rmask)
+
+
+@triton.jit
+def _ck_lse_reduce_kernel(PMAX, PSUM, PIDX, LSE, AMAX, NT, n_rows,
+                          BM: tl.constexpr):
+    pid = tl.program_id(0)
+    rows = pid * BM + tl.arange(0, BM)
+    rmask = rows < n_rows
+    mx = tl.full((BM,), float("-inf"), dtype=tl.float32)
+    sm = tl.zeros((BM,), dtype=tl.float32)
+    idx = tl.zeros((BM,), dtype=tl.int32)
+    for t in range(NT):
+        pm = tl.load(PMAX + rows * NT + t, mask=rmask, other=float("-inf"))
+        ps = tl.load(PSUM + rows * NT + t, mask=rmask, other=0.0)
+        pi = tl.load(PIDX + rows * NT + t, mask=rmask, other=0)
+        new_mx = tl.maximum(mx, pm)
+        idx = tl.where(pm > mx, pi, idx)
+        sm = sm * tl.exp(mx - new_mx) + ps * tl.exp(pm - new_mx)
+        mx = new_mx
+    lse = mx + tl.log(sm)
+    tl.store(LSE + rows, lse, mask=rmask)
+    tl.store(AMAX + rows, idx, mask=rmask)
+
+
+@triton.jit
+def _ck_nll_kernel(X, W16, TGT, LSE, NLL, n_rows, K, BM: tl.constexpr,
+                   BK: tl.constexpr):
+    pid = tl.program_id(0)
+    rows = pid * BM + tl.arange(0, BM)
+    rmask = rows < n_rows
+    y = tl.load(TGT + rows, mask=rmask, other=-100)
+    ymask = y != -100
+    y_safe = tl.where(ymask, y, 0).to(tl.int32)
+    oe = tl.arange(0, BK)
+    acc = tl.zeros((BM,), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        x = tl.load(X + rows[:, None] * K + (k0 + oe)[None, :],
+                    mask=rmask[:, None], other=0.0).to(tl.float32)
+        w = tl.load(W16 + y_safe[:, None] * K + (k0 + oe)[None, :],
+                    mask=ymask[:, None], other=0.0).to(tl.float32)
+        acc += tl.sum(x * w, axis=1)
+    nll = tl.where(ymask, acc - tl.load(LSE + rows, mask=rmask, other=0.0), 0.0)
+    tl.store(NLL + rows, nll, mask=rmask)
+
+
+@triton.jit
+def _ck_dlogits_kernel(X, W16, TGT, AM, LSE, ENT, DL, pstart, nrows,
+                       inv_den, K, NT,
+                       MB: tl.constexpr, BM: tl.constexpr,
+                       BN: tl.constexpr, BK: tl.constexpr):
+    nt = tl.program_id(0)
+    vw = nt * BN + tl.arange(0, BN)
+    for mb in tl.static_range(MB):
+        rows = pstart + mb * BM + tl.arange(0, BM)
+        rmask = rows < (pstart + nrows)
+        oe = tl.arange(0, BK)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            x = tl.load(X + rows[:, None] * K + (k0 + oe)[None, :],
+                        mask=rmask[:, None], other=0.0)
+            w = tl.load(W16 + vw[:, None] * K + (k0 + oe)[None, :])
+            acc = tl.dot(x, tl.trans(w), acc)
+        lg = acc.to(tl.float16).to(tl.float32)
+        lse = tl.load(LSE + rows, mask=rmask, other=0.0)
+        p = tl.exp(lg - lse[:, None])
+        tgt = tl.load(TGT + rows, mask=rmask, other=-100)
+        labelled = (tgt != -100) & rmask
+        am = tl.load(AM + rows, mask=rmask, other=0.0)
+        contrib = tl.sum(p * (lg - lse[:, None]) * am[:, None], axis=1)
+        tl.atomic_add(ENT + rows, contrib, mask=rmask)
+        onehot = (vw[None, :] == tgt[:, None]).to(tl.float32)
+        d = tl.where(labelled[:, None], (p - onehot) * inv_den, 0.0)
+        dl_row = rows - pstart
+        tl.store(DL + dl_row[:, None] * (NT * BN) + vw[None, :],
+                 d.to(tl.float16), mask=rmask[:, None])
+
+
+def _w16_for(weight):
+    """Cached fp16 copy of the frozen fp32 lm_head weight (our cast kernel)."""
+    key = (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
+    if _W16["key"] == key:
+        return _W16["tensor"]
+    numel = weight.numel()
+    w16 = torch.empty(numel, dtype=torch.float16, device=weight.device)
+    step = 8192
+    _ck_cast_kernel[((numel + step - 1) // step,)](
+        weight.reshape(-1), w16, numel, BLOCK=step, num_warps=8
+    )
+    w16 = w16.view_as(weight)
+    _W16["key"] = key
+    _W16["tensor"] = w16
+    return w16
+
+
+class CKHeadStep:
+    """What the rewind recorder consumes for one micro-batch (#1693).
+
+    ``token_loss`` is (B, T) float32: position t holds the cross-entropy of
+    ``labels[:, t + 1]`` and 0.0 where that label is -100 (or there is none).
+    """
+
+    def __init__(self, token_loss):
+        self.token_loss = token_loss
+
+
+class CKHeadHook:
+    """Holds per-step values and forwards metrics/logits-free state to TRL."""
+
+    def __init__(self):
+        self.trainer = None
+        self.step = None
+
+    def store_step(self, trainer, chunked):
+        try:
+            from soup_cli.utils.stream_loss_chunk import STEP_ATTR
+            setattr(trainer, STEP_ATTR, chunked)
+        except Exception:
+            pass
+
+    def on_backward_done(self, trainer, entropy, accuracy):
+        if trainer is None:
+            return
+        m = getattr(trainer, "_metrics", None)
+        if m is None or "train" not in m:
+            return
+        m["train"]["entropy"].append(entropy)
+        m["train"]["mean_token_accuracy"].append(accuracy)
+
+
+def _engage_head_ok(weight, V, K):
+    return bool(
+        weight.is_cuda
+        and weight.dtype == torch.float32
+        and weight.is_contiguous()
+        and not weight.requires_grad
+        and V % _BN == 0
+        and K % _BK == 0
+    )
+
+
+def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
+    """Returns (loss fp32 tensor with grad, CKHeadStep) or None to fall back."""
+    B, S, K = hidden.shape
+    V = weight.shape[0]
+    if not _engage_head_ok(weight, V, K):
+        return None
+    if not hidden.is_contiguous():
+        hidden = hidden.contiguous()
+    npos = B * S
+    X = hidden.view(npos, K)
+    labels_flat = labels.reshape(-1)
+    tgt = torch.empty(npos, dtype=torch.int32, device=hidden.device)
+    tgt[:-1] = labels_flat[1:]
+    tgt.view(B, S)[:, -1] = -100
+    if attention_mask is not None and attention_mask.dim() == 2:
+        am = attention_mask.reshape(-1).to(torch.float32)
+    else:
+        am = torch.ones(npos, dtype=torch.float32, device=hidden.device)
+    starts = [p for p in range(0, npos, _CH)]
+    if starts[-1] != npos:
+        starts.append(npos)
+    NP = len(starts) - 1
+    piece_starts = torch.tensor(starts, dtype=torch.int32, device=hidden.device)
+    NT = V // _BN
+    NMB = NP * (_CH // _BM)
+    w16 = _w16_for(weight)
+    if w16 is None:
+        return None
+    if num_items is None:
+        den_val = float((tgt != -100).sum().item())
+    else:
+        den_val = float(num_items)
+    if den_val <= 0.0:
+        return None
+
+    class _CKHeadFn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, tgt_in, am_in, w16_in, starts_in):
+            pmax = torch.empty(NMB * _BM, NT, dtype=torch.float32,
+                               device=x.device)
+            psum = torch.empty(NMB * _BM, NT, dtype=torch.float32,
+                               device=x.device)
+            pidx = torch.empty(NMB * _BM, NT, dtype=torch.int32,
+                               device=x.device)
+            _ck_lse_fwd_kernel[(NP, NT)](
+                x, w16_in, starts_in, pmax, psum, pidx, K, NT,
+                MB=_CH // _BM, BM=_BM, BN=_BN, BK=_BK, num_warps=8, num_stages=2
+            )
+            lse = torch.empty(npos, dtype=torch.float32, device=x.device)
+            amax = torch.empty(npos, dtype=torch.int32, device=x.device)
+            _ck_lse_reduce_kernel[(NMB,)](
+                pmax, psum, pidx, lse, amax, NT, npos, BM=_BM, num_warps=4
+            )
+            nll = torch.empty(npos, dtype=torch.float32, device=x.device)
+            _ck_nll_kernel[(NMB,)](
+                x, w16_in, tgt_in, lse, nll, npos, K, BM=_BM, BK=_BK,
+                num_warps=4
+            )
+            loss = nll.sum() / den_val
+            ctx.save_for_backward(x, tgt_in, am_in, w16_in, starts_in, lse, amax)
+            ctx.NP, ctx.NT, ctx.den, ctx.K, ctx.V = NP, NT, den_val, K, V
+            step = CKHeadStep(nll.view(B, S).detach())
+            hook.step = step
+            if hook.trainer is not None:
+                hook.store_step(hook.trainer, step)
+            return loss
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            x, tgt_b, am_b, w16_b, starts_b, lse_b, amax_b = ctx.saved_tensors
+            dH = torch.empty(npos, K, dtype=torch.float16, device=x.device)
+            ent = torch.zeros(npos, dtype=torch.float32, device=x.device)
+            inv_den = 1.0 / ctx.den
+            for pi in range(ctx.NP):
+                a = pi * _CH
+                nrows = min(_CH, npos - a)
+                dl = torch.empty(nrows, ctx.V, dtype=torch.float16,
+                                 device=x.device)
+                _ck_dlogits_kernel[(ctx.NT,)](
+                    x, w16_b, tgt_b, am_b, lse_b, ent, dl, a, nrows, inv_den,
+                    K, ctx.NT, MB=_CH // _BM, BM=_BM, BN=_BN, BK=_BK,
+                    num_warps=8, num_stages=2
+                )
+                dH[a:a + nrows] = torch.mm(dl, w16_b)
+                del dl
+            am_sum = float(am_b.sum().item())
+            ent_mean = float((ent * am_b).sum() / max(am_sum, 1.0))
+            lab = tgt_b != -100
+            total = int(lab.sum().item())
+            acc = float(((amax_b == tgt_b) & lab).sum().item()) / total \
+                if total > 0 else 0.0
+            hook.on_backward_done(hook.trainer, ent_mean, acc)
+            return dH, None, None, None, None, None, None
+
+    loss = _CKHeadFn.apply(X, tgt, am, w16, piece_starts)
+    if hook.step is None:
+        return None
+    return loss, hook.step
