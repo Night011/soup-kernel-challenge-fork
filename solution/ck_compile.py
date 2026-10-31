@@ -138,8 +138,8 @@ def prepare_config(cfg, scale=2.0):
     add(head._ck_cast_kernel, (f, half, vocab * h), BLOCK=8192, num_warps=8)
     add(head._ck_head_exact_kernel, (f, f, i32, vocab * h), BLOCK=8192, num_warps=8)
     add(head._ck_embedding_kernel, (i64, half, f, 1024 * h, h, vocab), BLOCK=1024)
-    add(head._ck_lse_kernel, (f, i32, f, i32, f, f, vocab), BLOCK=4096, num_stages=1)
-    add(head._ck_ce_grad_kernel, (f, f, i32, half, vocab, f, f),
+    add(head._ck_lse_kernel, (half, i32, f, i32, f, f, vocab), BLOCK=4096, num_stages=1)
+    add(head._ck_ce_grad_kernel, (half, f, i32, half, vocab, f, f),
         BLOCK=1024, DEN_TENSOR=True)
     add(head._ck_scatter_grad_kernel, (half, i64, f, f, half, 1024 * h), H=h, BLOCK=1024)
     add(nf4._ck_nf4_kernel, (u8, u8, f, f, f, f, half, h * width),

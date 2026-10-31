@@ -14,7 +14,7 @@ the mask or by the shifted CE target:
   argmax for those rows — the metric/token-loss path stays ours;
 * training loss reuses those fp32 NLL values instead of constructing a second
   fp32 logits/log-softmax buffer; its gradient uses softmax math in Triton;
-* while each fp32 logits piece is live, Triton writes the scaled fp16
+* while each fp16 logits piece is live, Triton writes the scaled fp16
   softmax gradient and cuBLAS computes its hidden derivative;
 * backward scatters that derivative with the actual incoming loss scale.
   No logits are recomputed or retained for backward.
@@ -35,11 +35,11 @@ import torch
 import triton
 import triton.language as tl
 
-# _CH — rows per head piece (one fp32 logits piece is materialized).
+# _CH — rows per head piece (one fp16 logits piece is materialized).
 # _BLOCK — vocab elements per streaming step in the LSE kernel.
 _BN = 64
 _BK = 64
-_CH = 256
+_CH = 384
 _BLOCK = 4096
 
 _W16 = {"key": None, "tensor": None}
@@ -435,11 +435,10 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
             for start in range(0, n_keep, _CH):
                 end = min(start + _CH, n_keep)
                 nrows = end - start
-                # Tensor cores accumulate fp16 products in fp32. Keep that
-                # output precision through the loss instead of rounding the
-                # logits to fp16 before softmax.
+                # Match the stock autocast head's fp16 logits boundary.
+                # Loss reductions and exponentials still use fp32 in Triton.
                 with torch.autocast("cuda", enabled=False):
-                    logits = torch.mm(x_keep[start:end], wt, out_dtype=torch.float32)
+                    logits = torch.mm(x_keep[start:end], wt)
                 _ck_lse_kernel[(nrows,)](
                     logits, tgt_keep[start:end], lse[start:end],
                     amax[start:end], nll[start:end], ent[start:end],
