@@ -32,6 +32,8 @@ slower on a T4 and its compile time alone breaks the wall clock.  No full
 logits buffer is stored; the backward recomputes one 128-row piece at a time.
 """
 
+from bisect import bisect_left
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -252,12 +254,18 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
         tgt_keep = tgt.index_select(0, idx_keep)
         am_keep = am.index_select(0, idx_keep)
         lab_keep = tgt_keep != -100
-        n_lab = int(lab_keep.sum().item())
+        lab_pos = lab_keep.nonzero(as_tuple=False).squeeze(1)
+        n_lab = lab_pos.numel()
         if n_lab == 0:
             return None
-        x_lab = x_keep[lab_keep]
-        tgt_lab = tgt_keep[lab_keep].to(torch.long)
-        idx_lab = idx_keep[lab_keep]
+        x_lab = x_keep.index_select(0, lab_pos)
+        tgt_lab = tgt_keep.index_select(0, lab_pos).to(torch.long)
+        idx_lab = idx_keep.index_select(0, lab_pos)
+        # Resolve chunk boundaries once. Repeating nonzero() for every piece
+        # forces a GPU/CPU synchronization each time; the sorted positions are
+        # small, so one transfer avoids those repeated synchronizations.
+        lab_pos_host = lab_pos.cpu().tolist()
+        lab_pos_in_chunk = lab_pos.remainder(_CH)
 
     w16 = _w16_for(weight)
     if w16 is None:
@@ -290,16 +298,17 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
                     amax[start:end], nll[start:end], ent[start:end],
                     V, BLOCK=_BLOCK, num_warps=2, num_stages=1,
                 )
-                lab_chunk = lab_keep[start:end]
-                lab_rows = lab_chunk.nonzero(as_tuple=False).squeeze(1)
-                n_lab_chunk = lab_rows.numel()
+                first_lab = bisect_left(lab_pos_host, start)
+                last_lab = bisect_left(lab_pos_host, end, first_lab)
+                n_lab_chunk = last_lab - first_lab
                 if n_lab_chunk:
+                    lab_rows = lab_pos_in_chunk[first_lab:last_lab]
                     logits_lab = torch.empty((n_lab_chunk, V), dtype=torch.float32,
                                              device=x.device)
                     _ck_select_logits_kernel[(n_lab_chunk, triton.cdiv(V, 1024))](
                         logits, lab_rows, logits_lab, V, BLOCK=1024, num_warps=4,
                     )
-                    tgt_chunk = tgt_keep[start:end].index_select(0, lab_rows).to(torch.long)
+                    tgt_chunk = tgt_lab[first_lab:last_lab]
                     loss_sum += F.cross_entropy(
                         logits_lab, tgt_chunk, reduction="sum",
                     )
