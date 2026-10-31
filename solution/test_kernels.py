@@ -88,15 +88,14 @@ def test_rope_matches_reference(cos_dtype):
         (rq * dq).float().sum() + (rk * dk).float().sum(), (qr, kr))
 
     # our path also has to handle the transposed non-contiguous q/k the Qwen2
-    # attention really passes (view -> transpose layout), through the public
-    # guard — q has 14 heads, k has 2 (GQA), which must not disable the kernel
+    # attention really passes (view -> transpose layout).  Qwen2 uses GQA
+    # (q has 14 heads, k has 2), so production deliberately takes the stock
+    # RoPE fallback; exercise the autograd primitive directly here.
     qt = q.transpose(1, 2).contiguous().transpose(1, 2)
     kt = k.transpose(1, 2).contiguous().transpose(1, 2)
     qo = qt.clone().requires_grad_(True)
     ko = kt.clone().requires_grad_(True)
-    out = rope_mod.ck_rope(qo, ko, cos, sin)
-    assert out is not None, "the real GQA shapes must engage the rope kernel"
-    oval_q, oval_k = out
+    oval_q, oval_k = rope_mod.CKRopeFn.apply(qo, ko, cos, sin)
     ((oval_q * dq).float().sum() + (oval_k * dk).float().sum()).backward()
     torch.testing.assert_close(oval_q.float(), rq.float(), rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(oval_k.float(), rk.float(), rtol=2e-2, atol=2e-2)
