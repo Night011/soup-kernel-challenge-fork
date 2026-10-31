@@ -11,7 +11,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 
 
 def test_swiglu_matches_pytorch():
-    """Starter-kit example kernel (not ours, kept as the baseline check)."""
+    """Our 2-D tiled SwiGLU kernel vs the fp32 PyTorch formula."""
     from solution.swiglu import swiglu
 
     torch.manual_seed(0)
@@ -104,15 +104,19 @@ def test_rope_matches_reference(cos_dtype):
 
 
 def test_head_loss_matches_reference():
-    """K3: chunked fused head+CE vs fp16 logits + F.cross_entropy."""
+    """K3: compact chunked head + stock fp32 CE vs full fp16 logits + CE."""
     import solution.ck_head as head
 
     torch.manual_seed(0)
-    B, S, K, V = 2, 32, 64, 512   # V % 128 == 0
+    B, S, K, V = 2, 32, 64, 512   # V % _BN == 0, K % _BK == 0
     labelled_mid = 20
     hidden = torch.randn(B, S, K, device="cuda", dtype=torch.float16)
     weights = torch.randn(V, K, device="cuda", dtype=torch.float32)
     am = torch.ones(B, S, dtype=torch.long, device="cuda")
+    # A leading pad makes the preceding row's shifted label valid while its
+    # attention-mask value is zero.  Compact K3 must keep that row for CE,
+    # even though it excludes it from the entropy average.
+    am[0, :3] = 0
     am[:, -4:] = 0
     labels = torch.randint(0, V, (B, S), device="cuda")
     labels[am == 0] = -100
@@ -182,7 +186,7 @@ def test_smoke_full_qwen2_flow():
     from solution import integrate
     from transformers import AutoConfig, Qwen2ForCausalLM
 
-    solution.apply()  # same wiring as harness/_train.py: example + K1..K4
+    solution.apply()  # same wiring as harness/_train.py: own SwiGLU + K1..K4
 
     torch.manual_seed(0)
     cfg = AutoConfig.for_model(
@@ -245,9 +249,9 @@ def test_smoke_full_qwen2_flow():
 
 
 def test_head_real_geometry():
-    """K3 at the exact challenge geometry (V=151936, K=1536, 4x512 tokens), which
-    is where a full-length vocab tile (NT=1187) first runs. Catches head-path
-    breakage in ~10 s instead of a full train roundtrip."""
+    """K3 at the exact challenge geometry (V=151936, K=1536, 4x512 tokens):
+    compact rows, stock CE, and the fp32 body -> fp16 head cast. Catches
+    head-path breakage in ~10 s instead of a full train roundtrip."""
     import solution.ck_head as head
 
     torch.manual_seed(0)

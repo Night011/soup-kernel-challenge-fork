@@ -1,52 +1,81 @@
-"""EXAMPLE: fused SwiGLU, silu(gate) * up, for the Qwen2 MLP, forward and backward in Triton.
+"""Fused SwiGLU (silu(gate) * up) in Triton, forward and backward.
 
-It shows the whole path: a Triton kernel, a torch.autograd.Function around it, and a patch that
-makes Soup's model call it. These kernels do not count as your own kernel, under any name: add your
-own kernels next to them (keeping the example running is fine) or replace this file.
+This is our own 2-D tiled kernel, not the starter-kit 1-D example: one program
+covers a ``BM x BN`` tile of the flattened ``(rows, hidden)`` matrix, so the
+grid is smaller and the per-program work is large enough to amortise the
+sigmoid.  The math is the same fp32 formula the example/stock path uses:
+
+    out   = gate * sigmoid(gate) * up
+    dup   = grad * gate * sigmoid(gate)
+    dgate = grad * up * sigmoid(gate) * (1 + gate * (1 - sigmoid(gate)))
+
+and the result is rounded once to the output dtype.  The Qwen2 MLP patch is
+kept at the bottom; if the activation is not SiLU or the tensor is not on CUDA,
+the stock forward is used unchanged.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-BLOCK = 1024
+# 2-D tile: two rows x 1024 columns = 2048 elements per program.  The hidden
+# size of Qwen2.5-1.5B is 8960, so the column grid has a masked tail.
+_SW_BM = 2
+_SW_BN = 1024
 
 
 @triton.jit
-def example_swiglu_fwd_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK: tl.constexpr):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n_elements
-    gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+def _ck_swiglu_fwd_kernel(GATE, UP, OUT, M, N,
+                          BM: tl.constexpr, BN: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = pid_m * BM + tl.arange(0, BM)
+    cols = pid_n * BN + tl.arange(0, BN)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    offs = rows[:, None] * N + cols[None, :]
+
+    gate = tl.load(GATE + offs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(UP + offs, mask=mask, other=0.0).to(tl.float32)
     out = gate * tl.sigmoid(gate) * up
-    tl.store(out_ptr + offsets, out.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(OUT + offs, out.to(OUT.dtype.element_ty), mask=mask)
 
 
 @triton.jit
-def example_swiglu_bwd_kernel(grad_ptr, gate_ptr, up_ptr, dgate_ptr, dup_ptr, n_elements,
-                              BLOCK: tl.constexpr):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n_elements
-    grad = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+def _ck_swiglu_bwd_kernel(GRAD, GATE, UP, DGATE, DUP, M, N,
+                          BM: tl.constexpr, BN: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = pid_m * BM + tl.arange(0, BM)
+    cols = pid_n * BN + tl.arange(0, BN)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    offs = rows[:, None] * N + cols[None, :]
+
+    grad = tl.load(GRAD + offs, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.load(GATE + offs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(UP + offs, mask=mask, other=0.0).to(tl.float32)
+
     sig = tl.sigmoid(gate)
     dup = grad * gate * sig
     dgate = grad * up * sig * (1.0 + gate * (1.0 - sig))
-    tl.store(dgate_ptr + offsets, dgate.to(dgate_ptr.dtype.element_ty), mask=mask)
-    tl.store(dup_ptr + offsets, dup.to(dup_ptr.dtype.element_ty), mask=mask)
+    tl.store(DGATE + offs, dgate.to(DGATE.dtype.element_ty), mask=mask)
+    tl.store(DUP + offs, dup.to(DUP.dtype.element_ty), mask=mask)
 
 
 class SwiGLU(torch.autograd.Function):
-    """silu(gate) * up in one launch each way instead of three PyTorch ops."""
+    """silu(gate) * up in one launch each way instead of several PyTorch ops."""
 
     @staticmethod
     def forward(ctx, gate, up):
         gate = gate.contiguous()
         up = up.to(gate.dtype).contiguous()
+        rows = gate.numel() // gate.shape[-1]
+        cols = gate.shape[-1]
         out = torch.empty_like(gate)
-        n = gate.numel()
-        example_swiglu_fwd_kernel[(triton.cdiv(n, BLOCK),)](gate, up, out, n, BLOCK=BLOCK)
+        grid = (triton.cdiv(rows, _SW_BM), triton.cdiv(cols, _SW_BN))
+        _ck_swiglu_fwd_kernel[grid](
+            gate, up, out, rows, cols,
+            BM=_SW_BM, BN=_SW_BN, num_warps=4, num_stages=2,
+        )
         ctx.save_for_backward(gate, up)
         return out
 
@@ -54,10 +83,14 @@ class SwiGLU(torch.autograd.Function):
     def backward(ctx, grad):
         gate, up = ctx.saved_tensors
         grad = grad.to(gate.dtype).contiguous()
+        rows = gate.numel() // gate.shape[-1]
+        cols = gate.shape[-1]
         dgate, dup = torch.empty_like(gate), torch.empty_like(up)
-        n = gate.numel()
-        example_swiglu_bwd_kernel[(triton.cdiv(n, BLOCK),)](grad, gate, up, dgate, dup, n,
-                                                           BLOCK=BLOCK)
+        grid = (triton.cdiv(rows, _SW_BM), triton.cdiv(cols, _SW_BN))
+        _ck_swiglu_bwd_kernel[grid](
+            grad, gate, up, dgate, dup, rows, cols,
+            BM=_SW_BM, BN=_SW_BN, num_warps=4, num_stages=2,
+        )
         return dgate, dup
 
 

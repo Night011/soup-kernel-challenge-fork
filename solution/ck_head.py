@@ -1,47 +1,44 @@
-"""K3 — our own chunked lm_head + CE + entropy + accuracy (Triton).
+"""K3 — compact chunked lm_head + CE (Triton LSE for metrics, PyTorch CE).
 
 The reference path materializes a full fp16 logits tensor (4 x 512 x 151936)
 plus fp32 copies for log_softmax / cross-entropy / entropy — a few GB of
-transient buffers per step.  We keep only one 128-row logits piece alive.
+transient buffers per step.  We first drop every all-padding row (the K4 trim
+already removes all-padding columns) and then work only on the rows needed by
+the mask or by the shifted CE target:
 
-Per forward step (B*S rows, vocab V, hidden K):
+* the forward logits are built only for the rows needed by either the
+  attention mask (entropy metric) or the shifted CE target (loss).  A
+  leading-pad position can have a real shifted target, so the union is used,
+  not the attention mask alone;
+* our Triton ``_ck_lse_kernel`` produces per-row logsumexp, NLL, entropy and
+  argmax for those rows — the metric/token-loss path stays ours;
+* the training loss and its gradient use the same fp32 cross-entropy math as
+  the stock head, on the labelled rows only;
+* the backward recomputes the fp16 logits for the labelled rows and writes the
+  fp16 softmax gradient ``(p - onehot) / den`` in 128-row pieces, then
+  ``dH = dlogits_piece @ W16`` stays cuBLAS and is scattered back into the
+  full hidden gradient (zero at unlabelled/padded rows, exactly like the
+  reference's ignored positions).
 
-1. ``_ck_cast_kernel``       — frozen fp32 lm_head weight -> cached fp16 copy
-                               (values are bit-identical to the autocast-cast
-                               weight the fp16 reference matmul uses).
-2. ``_ck_lse_kernel``        — one program per row, three streaming passes over
-                               the row: max/argmax, sum(exp), and the entropy
-                               sum.  It produces logsumexp, the first-wins
-                               argmax, the per-token NLL and the raw entropy
-                               without a full fp32 logits tensor.
-3. ``_ck_dlogits_kernel``    — reads the 128-row fp16 logits piece (recomputed
-                               by cuBLAS in the backward) and turns it into the
-                               fp16 softmax gradient ((p - onehot) / den),
-                               zeros at ignored rows.
-4. ``dH = dlogits_piece @ W16`` stays a plain fp16 cuBLAS matmul, piece by
-   piece, so piece state is freed immediately.
+Why this is correct: the reference's cross-entropy is driven by the shifted
+labels, not by the attention mask.  A right-pad row has -100 there and a zero
+mask, so its logits, softmax gradient, token loss and entropy weight are all
+zero; a leading-pad row can still have a real shifted target (the first real
+token), so it is kept for the loss even though its mask weight is zero.  The
+union removes only values that the task, metrics or rewind consume as zero.
 
-The large forward and backward GEMMs are cuBLAS: a handwritten large-vocab
-Triton GEMM is much slower on a T4 and its compile time alone breaks the wall
-clock.  Our Triton kernels own the full-vocab softmax/metrics work, which is
-the part the reference does with several extra fp32 passes.  No full logits
-buffer is stored: the backward recomputes one 128-row piece at a time, so peak
-memory stays below the stock full-logits path.
-
-den is the cross-entropy denominator the Trainer already computes
-(num_items_in_batch), so loss value and every gradient scale match the
-reference exactly.  Per-token losses are exposed through a CKHeadStep so the
-rewind recorder can produce row losses without logits.
+The large GEMMs stay cuBLAS: a handwritten large-vocab Triton GEMM is much
+slower on a T4 and its compile time alone breaks the wall clock.  No full
+logits buffer is stored; the backward recomputes one 128-row piece at a time.
 """
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# _BM rows x _BN columns — tile of the elementwise dlogits pass.
 # _CH — rows per head piece (a 128-row logits piece is the only large temp).
 # _BLOCK — vocab elements per streaming step in the LSE kernel.
-_BM = 64
 _BN = 64
 _BK = 64
 _CH = 128
@@ -64,10 +61,10 @@ def _ck_lse_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, V,
                    BLOCK: tl.constexpr):
     """Per-row logsumexp + argmax + NLL + entropy.
 
-    Three passes over one row keep the kernel simple and numerically identical
-    to the reference fp32 logsumexp: max/argmax, sum(exp), and the entropy
-    reduction.  No full logits buffer is written; the backward recomputes the
-    128-row fp16 logits piece with cuBLAS and feeds it to the dlogits kernel.
+    Three streaming passes over one row keep the kernel simple and numerically
+    identical to the reference fp32 logsumexp: max/argmax, sum(exp), and the
+    entropy reduction.  Only rows kept by the mask/target union reach it; the
+    caller applies the attention-mask weight when averaging the entropy.
     """
     r = tl.program_id(0)
     row = LOGITS + r * V
@@ -110,26 +107,6 @@ def _ck_lse_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, V,
     tl.store(AMAX + r, amax)
     tl.store(NLL + r, nll)
     tl.store(ENT + r, ent)
-
-
-@triton.jit
-def _ck_dlogits_kernel(LOGITS, TGT, LSE, DL, nrows, inv_den, V,
-                       BM: tl.constexpr, BN: tl.constexpr):
-    rb = tl.program_id(0)
-    nt = tl.program_id(1)
-    rows = rb * BM + tl.arange(0, BM)
-    rmask = rows < nrows
-    vw = nt * BN + tl.arange(0, BN)
-    lg = tl.load(LOGITS + rows[:, None] * V + vw[None, :],
-                 mask=rmask[:, None], other=0.0).to(tl.float32)
-    lse = tl.load(LSE + rows, mask=rmask, other=0.0)
-    p = tl.exp(lg - lse[:, None])
-    tgt = tl.load(TGT + rows, mask=rmask, other=-100)
-    labelled = (tgt != -100) & rmask
-    onehot = (vw[None, :] == tgt[:, None]).to(tl.float32)
-    d = tl.where(labelled[:, None], (p - onehot) * inv_den, 0.0)
-    tl.store(DL + rows[:, None] * V + vw[None, :],
-             d.to(tl.float16), mask=rmask[:, None])
 
 
 def _w16_for(weight):
@@ -218,15 +195,40 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
     tgt = torch.empty(npos, dtype=torch.int32, device=hidden.device)
     tgt[:-1] = labels_flat[1:]
     tgt.view(B, S)[:, -1] = -100
+
     if attention_mask is not None and attention_mask.dim() == 2:
         am = attention_mask.reshape(-1).to(torch.float32)
     else:
         am = torch.ones(npos, dtype=torch.float32, device=hidden.device)
+
+    # Keep rows needed by either the entropy metric (attention mask) or the
+    # shifted CE target.  A leading-pad position can have a real shifted target
+    # (the first real token), so the attention mask alone is not enough: the
+    # reference CE is driven by shift_labels, not by the mask.
+    # These are plain index/copy operations, not part of the autograd graph:
+    # the custom Function below owns the only gradient path (dH -> X).
+    with torch.no_grad():
+        keep = (am != 0) | (tgt != -100)
+        idx_keep = keep.nonzero(as_tuple=False).squeeze(1)
+        n_keep = idx_keep.numel()
+        if n_keep == 0:
+            return None
+        x_keep = X.index_select(0, idx_keep)
+        tgt_keep = tgt.index_select(0, idx_keep)
+        am_keep = am.index_select(0, idx_keep)
+        lab_keep = tgt_keep != -100
+        n_lab = int(lab_keep.sum().item())
+        if n_lab == 0:
+            return None
+        x_lab = x_keep[lab_keep]
+        tgt_lab = tgt_keep[lab_keep].to(torch.long)
+        idx_lab = idx_keep[lab_keep]
+
     w16 = _w16_for(weight)
     if w16 is None:
         return None
     if num_items is None:
-        den_val = float((tgt != -100).sum().item())
+        den_val = float(n_lab)
     else:
         den_val = float(num_items)
     if den_val <= 0.0:
@@ -236,25 +238,42 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
         @staticmethod
         def forward(ctx, x, tgt_in, am_in, w16_in):
             # One 128-row fp16 logits piece at a time; no full logits buffer.
-            lse = torch.empty(npos, dtype=torch.float32, device=x.device)
-            amax = torch.empty(npos, dtype=torch.int32, device=x.device)
-            nll = torch.empty(npos, dtype=torch.float32, device=x.device)
-            ent = torch.empty(npos, dtype=torch.float32, device=x.device)
+            # The LSE pass runs over every kept row (mask or real shifted
+            # target); the CE runs over the labelled rows of the same pieces.
+            lse = torch.empty(n_keep, dtype=torch.float32, device=x.device)
+            amax = torch.empty(n_keep, dtype=torch.int32, device=x.device)
+            nll = torch.empty(n_keep, dtype=torch.float32, device=x.device)
+            ent = torch.empty(n_keep, dtype=torch.float32, device=x.device)
+            loss_sum = torch.zeros((), dtype=torch.float32, device=x.device)
             wt = w16_in.t()
-            for start in range(0, npos, _CH):
-                end = min(start + _CH, npos)
+            for start in range(0, n_keep, _CH):
+                end = min(start + _CH, n_keep)
                 nrows = end - start
-                logits = torch.mm(x[start:end], wt)
+                logits = torch.mm(x_keep[start:end], wt)
                 _ck_lse_kernel[(nrows,)](
-                    logits, tgt_in[start:end], lse[start:end],
+                    logits, tgt_keep[start:end], lse[start:end],
                     amax[start:end], nll[start:end], ent[start:end],
                     V, BLOCK=_BLOCK, num_warps=2, num_stages=1,
                 )
+                lab_chunk = lab_keep[start:end]
+                if bool(lab_chunk.any()):
+                    logits_lab = logits[lab_chunk]
+                    tgt_chunk = tgt_keep[start:end][lab_chunk].to(torch.long)
+                    loss_sum += F.cross_entropy(
+                        logits_lab.float(), tgt_chunk, reduction="sum",
+                    )
                 del logits
-            loss = nll.sum() / den_val
-            ctx.save_for_backward(x, tgt_in, am_in, w16_in, lse, amax, ent)
+            loss = loss_sum / den_val
+            token_loss = torch.zeros((B, S), dtype=torch.float32,
+                                     device=x.device)
+            token_loss.view(-1)[idx_keep] = nll
+            ctx.save_for_backward(x_lab, tgt_lab, w16_in, idx_lab)
             ctx.K, ctx.V, ctx.den = K, V, den_val
-            step = CKHeadStep(nll.view(B, S).detach())
+            ctx.npos, ctx.n_lab = npos, n_lab
+            ctx.ent_keep, ctx.amax_keep = ent, amax
+            ctx.am_keep = am_keep
+            ctx.tgt_keep, ctx.lab_keep = tgt_keep, lab_keep
+            step = CKHeadStep(token_loss.detach())
             hook.step = step
             if hook.trainer is not None:
                 hook.store_step(hook.trainer, step)
@@ -262,8 +281,10 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
 
         @staticmethod
         def backward(ctx, grad_out):
-            x_b, tgt_b, am_b, w16_b, lse_b, amax_b, ent_b = ctx.saved_tensors
-            dH = torch.empty(npos, ctx.K, dtype=torch.float16, device=tgt_b.device)
+            x_lab_b, tgt_lab_b, w16_b, idx_lab_b = ctx.saved_tensors
+            n_lab_b, npos_b, K_b, V_b = ctx.n_lab, ctx.npos, ctx.K, ctx.V
+            dH_lab = torch.empty(n_lab_b, K_b, dtype=torch.float16,
+                                 device=x_lab_b.device)
             # AMP/Accelerate may scale the scalar loss before calling us.  A
             # custom autograd Function must propagate that upstream gradient;
             # scaling inv_den keeps the fp16 dlogits far below the fp16 range
@@ -271,23 +292,27 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
             scale = float(grad_out) if grad_out is not None else 1.0
             inv_den = scale / ctx.den
             wt_b = w16_b.t()
-            for a in range(0, npos, _CH):
-                nrows = min(_CH, npos - a)
-                logits = torch.mm(x_b[a:a + nrows], wt_b)
-                dl = torch.empty(nrows, ctx.V, dtype=torch.float16,
-                                 device=tgt_b.device)
-                _ck_dlogits_kernel[((nrows + _BM - 1) // _BM, ctx.V // _BN)](
-                    logits, tgt_b[a:a + nrows], lse_b[a:a + nrows],
-                    dl, nrows, inv_den, ctx.V,
-                    BM=_BM, BN=_BN, num_warps=4, num_stages=2,
-                )
-                dH[a:a + nrows] = torch.mm(dl, w16_b)
-                del logits, dl
-            am_sum = float(am_b.sum().item())
-            ent_mean = float((ent_b * am_b).sum() / max(am_sum, 1.0))
-            lab = tgt_b != -100
-            total = int(lab.sum().item())
-            acc = float(((amax_b == tgt_b) & lab).sum().item()) / total \
+            for a in range(0, n_lab_b, _CH):
+                nrows = min(_CH, n_lab_b - a)
+                logits = torch.mm(x_lab_b[a:a + nrows], wt_b)
+                lg = logits.float()
+                mx = lg.max(dim=-1, keepdim=True).values
+                p = torch.exp(lg - mx)
+                p /= p.sum(dim=-1, keepdim=True)
+                rows = torch.arange(nrows, device=x_lab_b.device)
+                p[rows, tgt_lab_b[a:a + nrows]] -= 1.0
+                p *= inv_den
+                dH_lab[a:a + nrows] = torch.mm(p.to(torch.float16), w16_b)
+                del logits, lg, p
+            dH = torch.zeros(npos_b, K_b, dtype=torch.float16,
+                             device=x_lab_b.device)
+            dH.index_copy_(0, idx_lab_b, dH_lab)
+            am_sum = float(ctx.am_keep.sum().item())
+            ent_mean = float((ctx.ent_keep * ctx.am_keep).sum().item()) / am_sum \
+                if am_sum > 0 else 0.0
+            lab = ctx.lab_keep
+            total = int(ctx.n_lab)
+            acc = float(((ctx.amax_keep == ctx.tgt_keep) & lab).sum().item()) / total \
                 if total > 0 else 0.0
             hook.on_backward_done(hook.trainer, ent_mean, acc)
             return dH, None, None, None
