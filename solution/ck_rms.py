@@ -126,6 +126,8 @@ def patch_qwen2_rmsnorm():
 
     def rms_forward(self, hidden_states):
         global _RMS_WARNED
+        from .ck_padding import gather_norm_rows
+        hidden_states = gather_norm_rows(self, hidden_states)
         try:
             out = ck_rmsnorm(
                 hidden_states, self.weight, self.variance_epsilon,

@@ -460,6 +460,75 @@ def test_prepare_inputs_trim():
     assert torch.equal(out["attention_mask"], am[:, 0:5])
 
 
+def test_mlp_padding_layout_guards_and_restores():
+    from solution import ck_padding
+
+    am = torch.ones(2, 32, device="cuda", dtype=torch.long)
+    labels = torch.zeros_like(am)
+    assert ck_padding.mlp_layout(am, labels) is None
+    am[:, 19:] = 0
+    labels[am == 0] = -100
+    layout = ck_padding.mlp_layout(am, labels)
+    assert layout is not None and layout[0].numel() == 40
+    assert torch.isin(am.flatten().nonzero().flatten(), layout[0]).all()
+    am[0, :3] = 0
+    labels[0, :3] = -100
+    # Predicting the first real token requires the preceding padding query.
+    assert ck_padding.mlp_layout(am, labels) is None
+    labels[0, 3] = -100
+    assert ck_padding.mlp_layout(am, labels) is not None
+    with pytest.raises(RuntimeError):
+        with ck_padding.compact_mlp_rows(am, labels):
+            assert ck_padding._LAYOUT is not None
+            raise RuntimeError("restore the batch-local context")
+    assert ck_padding._LAYOUT is None
+
+
+@pytest.mark.parametrize("left_padding", [False, True])
+def test_mlp_padding_full_transformer_gradients(left_padding):
+    import solution
+    from solution.ck_padding import compact_mlp_rows
+    from transformers import Qwen2Config, Qwen2Model
+
+    solution.apply()
+    torch.manual_seed(18)
+    cfg = Qwen2Config(vocab_size=128, hidden_size=256, intermediate_size=512,
+                      num_hidden_layers=2, num_attention_heads=2,
+                      num_key_value_heads=1, max_position_embeddings=64,
+                      attention_dropout=0.0)
+    model = Qwen2Model(cfg).cuda().train()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for layer in model.layers:
+        layer.post_attention_layernorm._ck_output_fp16 = True
+        layer.post_attention_layernorm._ck_compact_mlp = True
+        layer.mlp._ck_compact_mlp = True
+    am = torch.zeros(2, 32, device="cuda", dtype=torch.long)
+    start = 3 if left_padding else 0
+    am[0, start:start + 13] = 1
+    am[1, start:start + 21] = 1
+    labels = torch.full_like(am, -100)
+    labels[am.bool()] = 1
+    labels[:, start] = -100
+    hidden = torch.randn(2, 32, 256, device="cuda")
+    gradient = torch.randn_like(hidden) * am[:, :, None]
+    reference_input = hidden.clone().requires_grad_()
+    with torch.autocast("cuda", dtype=torch.float16):
+        reference = model(inputs_embeds=reference_input, attention_mask=am,
+                          use_cache=False).last_hidden_state
+    reference.backward(gradient)
+    compact_input = hidden.clone().requires_grad_()
+    with compact_mlp_rows(am, labels), torch.autocast("cuda", dtype=torch.float16):
+        actual = model(inputs_embeds=compact_input, attention_mask=am,
+                       use_cache=False).last_hidden_state
+    actual.backward(gradient)
+    torch.testing.assert_close(actual[am.bool()], reference[am.bool()],
+                               rtol=3e-3, atol=3e-3)
+    difference = torch.linalg.vector_norm(compact_input.grad - reference_input.grad)
+    norm = torch.linalg.vector_norm(reference_input.grad)
+    assert float(difference / norm) < 0.015
+
+
 def test_smoke_full_qwen2_flow():
     """End-to-end: tiny Qwen2 in the Soup-T4 layout (fp32 body from
     `prepare_model_for_kbit_training`, fp16 autocast compute, fp32 frozen
