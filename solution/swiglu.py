@@ -18,10 +18,10 @@ import torch
 import triton
 import triton.language as tl
 
-# 2-D tile: two rows x 1024 columns = 2048 elements per program.  The hidden
+# 2-D tile: two rows x 2048 columns = 4096 elements per program.  The hidden
 # size of Qwen2.5-1.5B is 8960, so the column grid has a masked tail.
 _SW_BM = 2
-_SW_BN = 1024
+_SW_BN = 2048
 
 
 @triton.jit
@@ -74,7 +74,7 @@ class SwiGLU(torch.autograd.Function):
         grid = (triton.cdiv(rows, _SW_BM), triton.cdiv(cols, _SW_BN))
         _ck_swiglu_fwd_kernel[grid](
             gate, up, out, rows, cols,
-            BM=_SW_BM, BN=_SW_BN, num_warps=4, num_stages=2,
+            BM=_SW_BM, BN=_SW_BN, num_warps=8, num_stages=2,
         )
         ctx.save_for_backward(gate, up)
         return out
@@ -89,7 +89,7 @@ class SwiGLU(torch.autograd.Function):
         grid = (triton.cdiv(rows, _SW_BM), triton.cdiv(cols, _SW_BN))
         _ck_swiglu_bwd_kernel[grid](
             grad, gate, up, dgate, dup, rows, cols,
-            BM=_SW_BM, BN=_SW_BN, num_warps=4, num_stages=2,
+            BM=_SW_BM, BN=_SW_BN, num_warps=8, num_stages=2,
         )
         return dgate, dup
 
