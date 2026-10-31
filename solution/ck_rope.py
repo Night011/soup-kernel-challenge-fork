@@ -32,86 +32,6 @@ _ROPE_ROWS = 16          # sequence positions handled by one program
 _ROPE_WARNED = False     # print the fallback diagnostic only once
 
 
-@triton.jit
-def _ck_rope_fwd_kernel(
-    X, COS, SIN, Y,
-    S, H,
-    XB, XH, XS,
-    CB, CS,
-    SB, SS,
-    RD: tl.constexpr, BR: tl.constexpr,
-):
-    pid = tl.program_id(0)          # b * H + h
-    blk = tl.program_id(1)
-    b = pid // H
-    h = pid - b * H
-    s = blk * BR + tl.arange(0, BR)
-    smask = s < S
-    d = tl.arange(0, RD // 2)
-
-    x_base = b * XB + h * XH + s * XS
-    x1 = tl.load(X + x_base[:, None] + d[None, :],
-                 mask=smask[:, None], other=0.0).to(tl.float32)
-    x2 = tl.load(X + x_base[:, None] + d[None, :] + RD // 2,
-                 mask=smask[:, None], other=0.0).to(tl.float32)
-
-    c_base = b * CB + s * CS
-    c = tl.load(COS + c_base[:, None] + d[None, :],
-                mask=smask[:, None], other=0.0).to(tl.float32)
-    sn = tl.load(SIN + c_base[:, None] + d[None, :],
-                 mask=smask[:, None], other=0.0).to(tl.float32)
-
-    y1 = x1 * c - x2 * sn
-    y2 = x2 * c + x1 * sn
-
-    # The output is a fresh contiguous (B, H, S, RD) buffer, so its strides
-    # are fixed and do not need to be passed separately.
-    y_base = ((b * H + h) * S + s) * RD
-    tl.store(Y + y_base[:, None] + d[None, :],
-             y1.to(Y.dtype.element_ty), mask=smask[:, None])
-    tl.store(Y + y_base[:, None] + d[None, :] + RD // 2,
-             y2.to(Y.dtype.element_ty), mask=smask[:, None])
-
-
-@triton.jit
-def _ck_rope_bwd_kernel(
-    DY, COS, SIN, DX,
-    S, H,
-    GB, GH, GS,
-    CB, CS,
-    SB, SS,
-    RD: tl.constexpr, BR: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    blk = tl.program_id(1)
-    b = pid // H
-    h = pid - b * H
-    s = blk * BR + tl.arange(0, BR)
-    smask = s < S
-    d = tl.arange(0, RD // 2)
-
-    g_base = b * GB + h * GH + s * GS
-    dy1 = tl.load(DY + g_base[:, None] + d[None, :],
-                  mask=smask[:, None], other=0.0).to(tl.float32)
-    dy2 = tl.load(DY + g_base[:, None] + d[None, :] + RD // 2,
-                  mask=smask[:, None], other=0.0).to(tl.float32)
-
-    c_base = b * CB + s * CS
-    c = tl.load(COS + c_base[:, None] + d[None, :],
-                mask=smask[:, None], other=0.0).to(tl.float32)
-    sn = tl.load(SIN + c_base[:, None] + d[None, :],
-                 mask=smask[:, None], other=0.0).to(tl.float32)
-
-    dx1 = dy1 * c + dy2 * sn
-    dx2 = dy2 * c - dy1 * sn
-
-    x_base = ((b * H + h) * S + s) * RD
-    tl.store(DX + x_base[:, None] + d[None, :],
-             dx1.to(DX.dtype.element_ty), mask=smask[:, None])
-    tl.store(DX + x_base[:, None] + d[None, :] + RD // 2,
-             dx2.to(DX.dtype.element_ty), mask=smask[:, None])
-
-
 def _table3(t):
     """Accept (B, S, D) or the optional (B, 1, S, D) layout."""
     if t.dim() == 3:
@@ -138,64 +58,78 @@ def _dense_table(t, batch, seq, dim):
     return t
 
 
-def _rope_one(src, cos, sin, backward):
-    """Run one direction of the rotation for q or k.
-
-    ``src`` may be a transposed (B, H, S, D) view; only its last stride has to
-    be 1.  Backward gradients are made contiguous if they arrive with a
-    different last stride, because silently returning None there would drop the
-    RoPE gradient.
-    """
-    if src is None:
-        return None
-    if not src.is_cuda or src.dtype not in (torch.float16, torch.float32):
-        return None
-    if src.dim() != 4 or src.shape[-1] % 64 != 0:
-        return None
-    if src.stride(-1) != 1:
-        if not backward:
-            return None
-        src = src.contiguous()
-
-    batch, heads, seq, dim = src.shape
-    out = torch.empty(src.shape, dtype=src.dtype, device=src.device)
-    xb, xh, xs, _ = src.stride()
-    cb, cs, _ = cos.stride()
-    sb, ss, _ = sin.stride()
-
-    grid = (batch * heads, triton.cdiv(seq, _ROPE_ROWS))
-    kernel = _ck_rope_bwd_kernel if backward else _ck_rope_fwd_kernel
-    kernel[grid](
-        src, cos, sin, out,
-        seq, heads,
-        xb, xh, xs,
-        cb, cs,
-        sb, ss,
-        RD=dim, BR=_ROPE_ROWS, num_warps=4,
-    )
-    return out
-
-
 class CKRopeFn(torch.autograd.Function):
     """q/k rotation with the exact inverse-rotation backward."""
 
     @staticmethod
     def forward(ctx, q, k, cos, sin):
-        q_out = _rope_one(q, cos, sin, backward=False)
-        k_out = _rope_one(k, cos, sin, backward=False)
-        if q_out is None or k_out is None:
-            # ck_rope validated the layout before apply(); this only catches a
-            # late change (for example a different tensor subclass).
-            raise RuntimeError("CK RoPE layout is no longer supported")
+        q_out, k_out = _rope_pair(q, k, cos, sin, backward=False)
         ctx.save_for_backward(cos, sin)
         return q_out, k_out
 
     @staticmethod
     def backward(ctx, dq, dk):
         cos, sin = ctx.saved_tensors
-        gq = _rope_one(dq, cos, sin, backward=True)
-        gk = _rope_one(dk, cos, sin, backward=True)
+        gq, gk = _rope_pair(dq, dk, cos, sin, backward=True)
         return gq, gk, None, None
+
+
+@triton.jit
+def _ck_rope_pair_kernel(Q, K, COS, SIN, OQ, OK, S, HQ, HK,
+                          QB, QH, QS, KB, KH, KS, CB, CS, SB, SS,
+                          RD: tl.constexpr, BR: tl.constexpr,
+                          BACKWARD: tl.constexpr):
+    combined = tl.program_id(0)
+    batch = combined // (HQ + HK)
+    head = combined % (HQ + HK)
+    if head < HQ:
+        source, destination = Q, OQ
+        source_base = batch * QB + head * QH
+        source_stride = QS
+        output_base = (batch * HQ + head) * S * RD
+    else:
+        source, destination = K, OK
+        source_base = batch * KB + (head - HQ) * KH
+        source_stride = KS
+        output_base = (batch * HK + head - HQ) * S * RD
+    sequence = tl.program_id(1) * BR + tl.arange(0, BR)
+    dimension = tl.arange(0, RD // 2)
+    source_offset = source_base + sequence[:, None] * source_stride + dimension[None, :]
+    mask = sequence[:, None] < S
+    first = tl.load(source + source_offset, mask, other=0).to(tl.float32)
+    second = tl.load(source + source_offset + RD // 2, mask, other=0).to(tl.float32)
+    cosine = tl.load(COS + batch * CB + sequence[:, None] * CS + dimension[None, :],
+                     mask, other=0).to(tl.float32)
+    sine = tl.load(SIN + batch * SB + sequence[:, None] * SS + dimension[None, :],
+                   mask, other=0).to(tl.float32)
+    if BACKWARD:
+        out_first = first * cosine + second * sine
+        out_second = second * cosine - first * sine
+    else:
+        out_first = first * cosine - second * sine
+        out_second = second * cosine + first * sine
+    output_offset = output_base + sequence[:, None] * RD + dimension[None, :]
+    tl.store(destination + output_offset, out_first, mask)
+    tl.store(destination + output_offset + RD // 2, out_second, mask)
+
+
+def _rope_pair(q, k, cos, sin, backward):
+    if q.dtype != k.dtype:
+        raise RuntimeError("Joint RoPE requires equal q/k dtypes")
+    if q.stride(-1) != 1:
+        q = q.contiguous()
+    if k.stride(-1) != 1:
+        k = k.contiguous()
+    q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    k_out = torch.empty(k.shape, device=k.device, dtype=k.dtype)
+    batch, hq, sequence, dimension = q.shape
+    hk = k.shape[1]
+    _ck_rope_pair_kernel[(batch * (hq + hk), triton.cdiv(sequence, _ROPE_ROWS))](
+        q, k, cos, sin, q_out, k_out, sequence, hq, hk,
+        *q.stride()[:3], *k.stride()[:3], *cos.stride()[:2], *sin.stride()[:2],
+        RD=dimension, BR=_ROPE_ROWS, BACKWARD=backward, num_warps=4,
+    )
+    return q_out, k_out
 
 
 def ck_rope(q, k, cos, sin):
@@ -204,6 +138,8 @@ def ck_rope(q, k, cos, sin):
         return None
     if q.dtype not in (torch.float16, torch.float32) \
             or k.dtype not in (torch.float16, torch.float32):
+        return None
+    if q.dtype != k.dtype:
         return None
     if q.dim() != 4 or k.dim() != 4:
         return None
