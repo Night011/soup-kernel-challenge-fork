@@ -1,6 +1,7 @@
 """Compile normal training specializations concurrently inside the timed run.
 
-No kernels are executed here: Triton's warmup API only compiles. All worker
+No kernels are executed here: Triton's warmup API compiles, and its runtime
+handles are initialized without calling the launcher. All worker
 threads are joined before this function returns. The harness's fresh cache
 directory, GPU visibility and external whole-command timer are unchanged.
 """
@@ -127,7 +128,13 @@ def prepare_config(cfg, scale=2.0):
         failures = []
         for args, kwargs in specs:
             try:
-                kernel.warmup(*args, grid=(1, 1), **kwargs)
+                compiled = kernel.warmup(*args, grid=(1, 1), **kwargs)
+                # Triton normally defers launcher creation and CUDA module
+                # loading until the first real invocation. Prepare those
+                # handles in the same timed setup, without launching work.
+                initialize = getattr(compiled, "_init_handles", None)
+                if initialize is not None:
+                    initialize()
             except Exception as exc:
                 # Unsupported warmup signatures retain normal on-demand JIT.
                 failures.append((kernel.__name__, type(exc).__name__))

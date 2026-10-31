@@ -7,17 +7,17 @@ Development [Kaggle notebook](https://www.kaggle.com/code/hoogle57/notebook00ca7
 
 ## Measured results
 
-The last complete two-repeat comparison is [6e16e7d](https://github.com/BAITC-Hacks/hack-d5eb16fb-atlas-solutions/commit/6e16e7d), Kaggle directory `runs_full_6e16e7d`:
+The last complete two-repeat comparison is [9f9692a](https://github.com/BAITC-Hacks/hack-d5eb16fb-atlas-solutions/commit/9f9692a), Kaggle directory `runs_full_9f9692a`:
 
 | Metric | Base Soup | Solution | Ratio |
 |---|---:|---:|---:|
-| Whole soup train, mean of two runs | 77.11 s | 61.52 s | 1.2534× speedup |
-| Peak GPU memory | 14348 MiB | 5040 MiB | 2.8468× base/solution |
-| Public eval loss | 2.04965 | 2.04967 | +0.001% |
+| Whole soup train, mean of two runs | 76.86 s | 61.06 s | 1.2588× speedup |
+| Peak GPU memory | 14348 MiB | 4038 MiB (3.94 GiB) | 3.5532× base/solution |
+| Public eval loss | 2.04960 | 2.04957 | −0.001% |
 
-Solution times: 61.19 and 61.84 s. **All 10 rule checks passed**, including 79 Soup regression tests. Own-kernel shares: 13.316% and 12.975%; the lower value counts. Starter SwiGLU is excluded.
+Solution times: 60.69 and 61.43 s. **All 10 rule checks passed**, including 79 Soup regression tests; 63/63 GPU tests passed. Own-kernel shares: 19.808% and 19.324%; the lower value counts. Starter SwiGLU is excluded.
 
-Further development has changed the solution since that full comparison. An exploratory solution-only run of [7a8ba00](https://github.com/BAITC-Hacks/hack-d5eb16fb-atlas-solutions/commit/7a8ba00) gave **61.95 s, 4460 MiB (4.36 GiB), eval 2.04968**, own share **17.72%**, and **50/50 GPU tests**. It uses compact projections, paired NF4 decoding and a 768 MiB cache budget. That single run cannot establish the base-dependent rule checks. Later commits require fresh measurement.
+Further development has changed the solution since that full comparison: the newer attention compaction path is experimental until its own measurements finish. The table is evidence for 9f9692a, not a claim that every later commit has passed the ten checks.
 
 ## Implementation
 
@@ -29,7 +29,7 @@ The latest collator wrapper derives those indices, padding layout and token coun
 
 **Frozen head/embedding storage.** The original fp32 master remains intact on CPU; a fp16 compute copy stays on GPU. For tied embeddings this is enabled only if converting the copy back to fp32 exactly reproduces the master. An own lookup kernel emits those original fp32 embedding values. Stock no-grad forwards and disengagement restore the master. External adapter evaluation uses vanilla transformers/PEFT without our code.
 
-**NF4 and paired MLP.** Our decoder fuses NF4 lookup, double-quant scale decoding and offset addition, using the original codebooks. Tests require bitwise equality to bitsandbytes decoding. A separate kernel decodes gate/up directly into a combined matrix: one forward projection GEMM and one input-gradient GEMM replace two of each. The versioned fp16 cache now has a fixed 320 MiB budget, reserving complete gate/up pairs together. Uncached pairs are decoded on demand, not retained in autograd. Packed model weights remain frozen.
+**NF4 and paired MLP.** Our decoder fuses NF4 lookup, double-quant scale decoding and offset addition, using the original codebooks. Tests require bitwise equality to bitsandbytes decoding. A separate kernel decodes gate/up directly into a combined matrix: one forward projection GEMM and one input-gradient GEMM replace two of each. The versioned fp16 cache now has a fixed 64 MiB budget, reserving complete gate/up pairs together. Uncached pairs are decoded on demand, not retained in autograd. Packed model weights remain frozen.
 
 **Saved activations.** Forward uses the original fp16 gate/up values. Only backward storage is compressed to symmetric INT8 with a fp32 scale per 1024 values. RMSNorm saves fp16 input plus its original fp32 inverse standard deviation. These are small backward approximations, not bitwise-equivalence claims. Gradient tests and the complete public loss/metric/eval checks bound their observed effect; hidden quality remains to be checked by the jury.
 
@@ -70,7 +70,7 @@ python harness/score.py runs_final/result.json
 
 Use a new output directory per comparison. During development, `--only solution --out runs_try_<commit>` is faster but cannot establish the base-dependent checks. `--profile` adds a separate profiled run whose wall time is not the solution timing. Imports, cold JIT and adapter saving count in the measured command. The solution does not change the harness allocator, GPU selection or compiler-cache settings, or install packages during measurement.
 
-The latest compiler preparation uses Triton's compile-only warmup API with up to four compiler threads inside the measured process. Compilation overlaps ordinary model loading within the setup function; all threads are joined before that function returns and before training. The harness still starts from its own empty cache, and the full setup time remains in the wall-clock measurement. Warmup executes no GPU kernels and is not part of the claimed GPU kernel time; ordinary training launches supply that work.
+The latest compiler preparation uses Triton's compile-only warmup API with up to four compiler threads inside the measured process. It also initializes the compiled programs' launchers and CUDA module handles, without invoking those launchers. Preparation overlaps ordinary model loading within the setup function; all threads are joined before that function returns and before training. The harness still starts from its own empty cache, and the full setup time remains in the wall-clock measurement. Preparation executes no GPU kernels and is not part of the claimed GPU kernel time; ordinary training launches supply that work.
 
 ## Limits
 

@@ -8,7 +8,8 @@ with an autograd pair backed by two ``@triton.jit`` kernels:
   the downstream projections see exactly the values the fp16 autocast cast of
   the fp32 reference output would produce (residual stream stays fp32).
 * ``_ck_rms_bwd``  — ``dx_k = r*w_k*dy_k - (r^3 / H) * x_k * sum_d(w_d*dy_d*x_d)``
-  with ``r = rsqrt(mean(x^2)+eps)`` recomputed from the saved input.
+  reuses the exact fp32 rstd saved by forward. The production path saves an
+  fp16 copy of a fp32 input; this small backward approximation is tested.
 
 Guards: CUDA only, contiguous input in fp16/fp32 (the Soup T4 flow has an fp16
 residual stream with an fp16 weight — fp32 straight-loading is also accepted),
