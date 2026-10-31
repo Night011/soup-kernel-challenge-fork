@@ -16,8 +16,10 @@ def test_cached_embedding_exact_check_detects_rounding_and_nan():
     cached = torch.randn(19, 512, device="cuda", dtype=torch.float16)
     master = cached.float()
     assert _cached_embedding_is_exact(master, cached)
+    assert _cached_embedding_is_exact(master, master)
     master[2, 30] += 1e-5
     assert not _cached_embedding_is_exact(master, cached)
+    assert not _cached_embedding_is_exact(master, master)
     master = cached.float()
     master[3, 44] = float("nan")
     assert not _cached_embedding_is_exact(master, cached)

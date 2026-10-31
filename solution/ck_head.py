@@ -64,13 +64,12 @@ def offload_frozen_head(lm):
         return
     embedding = lm.get_input_embeddings()
     shared = embedding.weight is weight or embedding.weight.data_ptr() == weight.data_ptr()
-    compute_weight = _w16_for(weight)
     if shared:
         # k-bit preparation commonly upcasts an fp16 embedding to fp32.
         # Only offload a shared master if the cached representation is exact:
         # the lookup must reproduce the original fp32 embedding values.
         if (embedding.weight.requires_grad or embedding.max_norm is not None
-                or not _cached_embedding_is_exact(weight, compute_weight)):
+                or not _cached_embedding_is_exact(weight, weight)):
             lm._ck_head_offload_rejected = True
             return
         if not hasattr(embedding, "_ck_orig_embedding_forward"):
@@ -91,9 +90,13 @@ def offload_frozen_head(lm):
                 return out
 
             embedding.forward = types.MethodType(embedding_forward, embedding)
-    lm._ck_head_compute_weight = compute_weight
-    lm._ck_head_gpu_device = weight.device
+    device = weight.device
+    # Release the large GPU master before allocating its compute copy.
+    # Transfer fp32 pieces back for our cast, never a full GPU fp32 temporary.
     weight.data = weight.detach().cpu()
+    compute_weight = _w16_from_cpu(weight, device)
+    lm._ck_head_compute_weight = compute_weight
+    lm._ck_head_gpu_device = device
     _W16["key"] = _weight_key(weight)
     lm._ck_head_offloaded = True
     print("[ck] frozen fp32 head offloaded to CPU; fp16 compute copy on GPU", flush=True)
@@ -103,7 +106,7 @@ def offload_frozen_head(lm):
 def _ck_head_exact_kernel(MASTER, CACHED, DIFFERENT, N, BLOCK: tl.constexpr):
     index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     original = tl.load(MASTER + index, index < N, other=0).to(tl.float32)
-    cached = tl.load(CACHED + index, index < N, other=0).to(tl.float32)
+    cached = tl.load(CACHED + index, index < N, other=0).to(tl.float16).to(tl.float32)
     different = tl.sum(((original != cached) & (index < N)).to(tl.int32), 0)
     tl.store(DIFFERENT + tl.program_id(0), different)
 
@@ -114,6 +117,21 @@ def _cached_embedding_is_exact(master, cached):
     _ck_head_exact_kernel[(blocks,)](master, cached, different, master.numel(),
                                     BLOCK=8192, num_warps=8)
     return not bool(different.any().item())
+
+
+def _w16_from_cpu(weight, device):
+    flat = weight.detach().view(-1)
+    _W16["tensor"], _W16["key"] = None, None
+    out = torch.empty(flat.numel(), device=device, dtype=torch.float16)
+    for start in range(0, flat.numel(), 8 * 2**20):
+        end = min(start + 8 * 2**20, flat.numel())
+        piece = flat[start:end].to(device)
+        _ck_cast_kernel[(triton.cdiv(end - start, 8192),)](
+            piece, out[start:end], end - start, BLOCK=8192, num_warps=8)
+        del piece
+    out = out.view_as(weight)
+    _W16["tensor"], _W16["key"] = out, _weight_key(weight)
+    return out
 
 
 @triton.jit

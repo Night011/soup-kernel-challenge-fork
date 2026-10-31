@@ -63,6 +63,7 @@ def prepare_config(cfg, scale=2.0):
             H=h, BLOCK=block, num_stages=2)
     add(head._ck_cast_kernel, (f, half, vocab * h), BLOCK=8192, num_warps=8)
     add(head._ck_head_exact_kernel, (f, half, i32, vocab * h), BLOCK=8192, num_warps=8)
+    add(head._ck_head_exact_kernel, (f, f, i32, vocab * h), BLOCK=8192, num_warps=8)
     add(head._ck_embedding_kernel, (i64, half, f, 1024 * h, h, vocab), BLOCK=1024)
     add(head._ck_lse_kernel, (f, i32, f, i32, f, f, vocab), BLOCK=4096, num_stages=1)
     add(head._ck_ce_grad_kernel, (f, f, i32, half, vocab, f, f),
@@ -101,6 +102,7 @@ def prepare_config(cfg, scale=2.0):
     for columns in sorted({h, kv}):
         add(padding._ck_scatter_rows_kernel, (half, i32, half, 1024 * columns),
             H=columns, BLOCK=1024)
+    add(padding._ck_scatter_rows_kernel, (f, i32, f, 1024 * h), H=h, BLOCK=1024)
     add(residual._ck_residual_norm_fwd_kernel, (f, half, f, i32, f, half, half, f, eps),
         H=h, BLOCK=block)
     add(residual._ck_residual_norm_bwd_kernel, (f, half, f, i32, half, f, f, half),
