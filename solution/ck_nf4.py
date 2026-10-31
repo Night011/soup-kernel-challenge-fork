@@ -13,11 +13,34 @@ _ORIGINAL_DEQUANT = None
 _ORIGINAL_MATMUL_FORWARD = None
 _CACHEABLE = set()
 _DECODED = {}
+_PAIRED = {}
 
 
 def clear_weight_cache():
     _CACHEABLE.clear()
     _DECODED.clear()
+    _PAIRED.clear()
+
+
+def paired_mlp_weights(gate_weight, up_weight):
+    """Concatenate exact gate/up matrices once, replacing their separate cache."""
+    gp, up = gate_weight.data_ptr(), up_weight.data_ptr()
+    if gp not in _CACHEABLE or up not in _CACHEABLE:
+        return None
+    gs, us = gate_weight.quant_state, up_weight.quant_state
+    version = (_cache_key(gate_weight, gs), _cache_key(up_weight, us))
+    cached = _PAIRED.get((gp, up))
+    if cached is not None and cached[0] == version:
+        return cached[1]
+    g = decode_nf4(gate_weight, gs)
+    u = decode_nf4(up_weight, us)
+    if g is None or u is None:
+        return None
+    combined = torch.cat((g, u), dim=0)
+    _DECODED.pop(gp, None)
+    _DECODED.pop(up, None)
+    _PAIRED[(gp, up)] = (version, combined)
+    return combined
 
 
 def register_mlp_cache(lm, limit_bytes=1536 * 2**20):
