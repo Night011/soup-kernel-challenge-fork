@@ -77,7 +77,8 @@ def test_streamed_head_statistics(dtype, vocab):
     torch.testing.assert_close(amax, z.argmax(-1).int(), rtol=0, atol=0)
 
 
-def test_swiglu_matches_pytorch():
+@pytest.mark.parametrize("compress", [False, True])
+def test_swiglu_matches_pytorch(compress):
     """The starter-derived tiled SwiGLU vs the fp32 PyTorch formula."""
     from solution.swiglu import swiglu
 
@@ -93,11 +94,20 @@ def test_swiglu_matches_pytorch():
     dgate, dup = gate.grad.clone(), up.grad.clone()
     gate.grad = up.grad = None
 
-    out = swiglu(gate, up)
+    out = swiglu(gate, up, compress=compress)
     out.backward(grad)
     torch.testing.assert_close(out.float(), ref, rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(gate.grad.float(), dgate.float(), rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(up.grad.float(), dup.float(), rtol=2e-3, atol=2e-3)
+    if compress:
+        # Compression approximates saved backward inputs. Bound the whole
+        # gradient error, including near-zero elements where relative element
+        # errors are uninformative. Final adapter quality is checked by eval.
+        for actual, expected in ((gate.grad, dgate), (up.grad, dup)):
+            error = torch.linalg.vector_norm(actual.float() - expected.float())
+            reference_norm = torch.linalg.vector_norm(expected.float())
+            assert float(error / reference_norm) < 0.015
+    else:
+        torch.testing.assert_close(gate.grad.float(), dgate.float(), rtol=2e-3, atol=2e-3)
+        torch.testing.assert_close(up.grad.float(), dup.float(), rtol=2e-3, atol=2e-3)
 
 
 def test_shared_frozen_head_offload():
