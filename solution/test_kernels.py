@@ -287,6 +287,26 @@ def test_rmsnorm_fp16_projection_boundary():
     torch.testing.assert_close(xo.grad, xr.grad, rtol=2e-3, atol=2e-3)
 
 
+@pytest.mark.parametrize("half_output", [False, True])
+def test_rmsnorm_compact_saved_input(half_output):
+    from solution.ck_rms import CKRMSNormFn
+
+    torch.manual_seed(13)
+    x = torch.randn(4, 31, 1536, device="cuda", dtype=torch.float32)
+    w = torch.randn(1536, device="cuda", dtype=torch.float32)
+    dy = torch.randn_like(x, dtype=torch.float16 if half_output else torch.float32)
+    xr = x.clone().requires_grad_()
+    ref = w * (xr * torch.rsqrt(xr.square().mean(-1, keepdim=True) + 1e-6))
+    if half_output:
+        ref = ref.half()
+    ref.backward(dy)
+    xo = x.clone().requires_grad_()
+    out = CKRMSNormFn.apply(xo, w, 1e-6, half_output, True)
+    out.backward(dy)
+    torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(xo.grad, xr.grad, rtol=2e-3, atol=2e-3)
+
+
 @pytest.mark.parametrize("amp_scale", [None, 65536.0])
 def test_head_loss_matches_reference(amp_scale):
     """K3: compact chunked head + stock fp32 CE vs full fp16 logits + CE."""
