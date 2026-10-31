@@ -11,13 +11,13 @@ data order, steps, optimizer and Soup's outputs are untouched.
 | `_ck_rms_fwd_kernel` / `_ck_rms_bwd_kernel` | `solution/ck_rms.py` | element-wise chain of `Qwen2RMSNorm` (upcast, pow, mean, rsqrt, weight-mul, dtype casts) — one fused pass per row, forward emits fp16 directly (the value the fp16 autocast cast produces), residual stream stays fp32 |
 | `_ck_rope_fwd_kernel` / `_ck_rope_bwd_kernel` | `solution/ck_rope.py` | `apply_rotary_pos_emb` (q * cos + rotate_half(q) * sin on q and k, fp32 math, fp16 out) with the inverse-rotary backward |
 | `_ck_cast_kernel` | `solution/ck_head.py` | fp32→fp16 cast of the frozen lm_head weight into a cached fp16 copy (values equal to the autocast-cast weight the reference matmul uses) |
-| `_ck_lse_store_kernel` | `solution/ck_head.py` | one program per row over the chunked cuBLAS logits piece: max/argmax, sum(exp), fp16 logits copy, entropy — produces per-row logsumexp, NLL and raw entropy without a full fp32 logits tensor |
-| `_ck_dlogits_kernel` | `solution/ck_head.py` | reads the stored fp16 logits piece and writes the fp16 softmax gradient `(p − onehot)/den` (zeros at ignored positions); no second logits GEMM |
+| `_ck_lse_kernel` | `solution/ck_head.py` | one program per row over the 128-row cuBLAS logits piece: max/argmax, sum(exp), entropy — produces per-row logsumexp, NLL and raw entropy without a full fp32 logits tensor |
+| `_ck_dlogits_kernel` | `solution/ck_head.py` | reads the recomputed 128-row fp16 logits piece and writes the fp16 softmax gradient `(p − onehot)/den` (zeros at ignored positions) |
 
-The large forward logits GEMM and `dH = dlogits_piece @ W16` stay cuBLAS matmuls,
-done piece by piece so the 256-row piece state is freed before the next piece is
-built. A handwritten large-vocab Triton GEMM is much slower on a T4 and its
-compile time alone breaks the wall clock.
+The large forward/backward logits GEMMs and `dH = dlogits_piece @ W16` stay
+cuBLAS matmuls, done piece by piece so only one 128-row piece is alive at a time.
+No full logits buffer is stored. A handwritten large-vocab Triton GEMM is much
+slower on a T4 and its compile time alone breaks the wall clock.
 
 Plus two non-kernel hooks:
 
@@ -39,12 +39,12 @@ The stock run materializes fp16 logits (4 × 512 × 151936), then fp32 copies fo
 log_softmax, cross-entropy and the entropy metric — several GB of transient
 buffers per step. This is both the time spent in element-wise passes over the
 whole vocab and the reason `soup train` sits close to the T4's memory ceiling.
-Our chunked path builds one 256-row cuBLAS logits piece (≈ 78 MiB fp16), streams
-it into a chunked fp16 logits buffer (≈ 622 MiB for the 2048-row batch), and owns
-the full-vocab softmax/metrics work with Triton. The backward reads that stored
-fp16 logits buffer, so it needs no second logits GEMM; only `dH = dlogits @ W16`
-stays cuBLAS. This removes the reference's fp32 logits copies and one of its two
-large head GEMMs.
+Our chunked path builds one 128-row cuBLAS logits piece (≈ 39 MiB fp16) and owns
+the full-vocab softmax/metrics work with Triton. The backward recomputes one
+128-row logits piece at a time and feeds it to the dlogits kernel, so peak
+memory stays below the stock full-logits path; the large forward/backward logits
+GEMMs and `dH = dlogits @ W16` stay cuBLAS. This removes the reference's fp32
+logits copies without adding a full logits buffer.
 
 ## Quality
 
@@ -53,7 +53,7 @@ The loss value, its gradient and every logged metric follow the reference math:
 * logits rounding: the cuBLAS fp16 GEMM produces the same fp16 logits as the
   reference; our Triton LSE/CE then runs in fp32 on those values, like
   `ForCausalLMLoss` does after `logits.float()`, and the backward dlogits reads
-  the same stored fp16 logits;
+  the same cuBLAS fp16 logits recomputed for that piece;
 * the gradient of the mean CE is `(p − onehot) / num_items` with zeros at
   ignored positions, folded into `den = num_items_in_batch` the Trainer already
   computes;

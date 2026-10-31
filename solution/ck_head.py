@@ -2,29 +2,31 @@
 
 The reference path materializes a full fp16 logits tensor (4 x 512 x 151936)
 plus fp32 copies for log_softmax / cross-entropy / entropy — a few GB of
-transient buffers per step.  We keep only one 256-row logits piece alive.
+transient buffers per step.  We keep only one 128-row logits piece alive.
 
 Per forward step (B*S rows, vocab V, hidden K):
 
 1. ``_ck_cast_kernel``       — frozen fp32 lm_head weight -> cached fp16 copy
                                (values are bit-identical to the autocast-cast
                                weight the fp16 reference matmul uses).
-2. ``_ck_lse_store_kernel``  — one program per row, four streaming passes over
-                               the row: max/argmax, sum(exp), copy the fp16
-                               logits into the chunked logits buffer, and the
-                               entropy sum.  It produces logsumexp, the first-
-                               wins argmax, the per-token NLL and the raw
-                               entropy without a full fp32 logits tensor.
-3. ``_ck_dlogits_kernel``    — reads the stored fp16 logits piece and turns it
-                               into the fp16 softmax gradient
-                               ((p - onehot) / den), zeros at ignored rows.
+2. ``_ck_lse_kernel``        — one program per row, three streaming passes over
+                               the row: max/argmax, sum(exp), and the entropy
+                               sum.  It produces logsumexp, the first-wins
+                               argmax, the per-token NLL and the raw entropy
+                               without a full fp32 logits tensor.
+3. ``_ck_dlogits_kernel``    — reads the 128-row fp16 logits piece (recomputed
+                               by cuBLAS in the backward) and turns it into the
+                               fp16 softmax gradient ((p - onehot) / den),
+                               zeros at ignored rows.
 4. ``dH = dlogits_piece @ W16`` stays a plain fp16 cuBLAS matmul, piece by
    piece, so piece state is freed immediately.
 
 The large forward and backward GEMMs are cuBLAS: a handwritten large-vocab
 Triton GEMM is much slower on a T4 and its compile time alone breaks the wall
 clock.  Our Triton kernels own the full-vocab softmax/metrics work, which is
-the part the reference does with several extra fp32 passes.
+the part the reference does with several extra fp32 passes.  No full logits
+buffer is stored: the backward recomputes one 128-row piece at a time, so peak
+memory stays below the stock full-logits path.
 
 den is the cross-entropy denominator the Trainer already computes
 (num_items_in_batch), so loss value and every gradient scale match the
@@ -37,12 +39,12 @@ import triton
 import triton.language as tl
 
 # _BM rows x _BN columns — tile of the elementwise dlogits pass.
-# _CH — rows per head piece (a 256-row logits piece is the only large temp).
+# _CH — rows per head piece (a 128-row logits piece is the only large temp).
 # _BLOCK — vocab elements per streaming step in the LSE kernel.
 _BM = 64
 _BN = 64
 _BK = 64
-_CH = 256
+_CH = 128
 _BLOCK = 256
 
 _W16 = {"key": None, "tensor": None}
@@ -58,14 +60,14 @@ def _ck_cast_kernel(SRC, DST, n, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _ck_lse_store_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, LOGF, V,
-                         BLOCK: tl.constexpr):
-    """Per-row logsumexp + argmax + NLL + entropy, and a copy of the logits.
+def _ck_lse_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, V,
+                   BLOCK: tl.constexpr):
+    """Per-row logsumexp + argmax + NLL + entropy.
 
-    Four passes over one row keep the kernel simple and numerically identical
-    to the reference fp32 logsumexp: max/argmax, sum(exp), logits copy, and
-    the entropy reduction.  LOGF is the chunked fp16 logits buffer consumed by
-    the backward dlogits kernel, so the backward needs no second GEMM.
+    Three passes over one row keep the kernel simple and numerically identical
+    to the reference fp32 logsumexp: max/argmax, sum(exp), and the entropy
+    reduction.  No full logits buffer is written; the backward recomputes the
+    128-row fp16 logits piece with cuBLAS and feeds it to the dlogits kernel.
     """
     r = tl.program_id(0)
     row = LOGITS + r * V
@@ -95,12 +97,6 @@ def _ck_lse_store_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, LOGF, V,
     tgt_safe = tl.where(valid, tgt, 0)
     tlog = tl.load(row + tgt_safe).to(tl.float32)
     nll = tl.where(valid, lse - tlog, 0.0)
-
-    for v0 in range(0, V, BLOCK):
-        offs = v0 + tl.arange(0, BLOCK)
-        mask = offs < V
-        x = tl.load(row + offs, mask=mask, other=0.0)
-        tl.store(LOGF + r * V + offs, x, mask=mask)
 
     ent = 0.0
     for v0 in range(0, V, BLOCK):
@@ -239,10 +235,7 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
     class _CKHeadFn(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, tgt_in, am_in, w16_in):
-            # The only large temporary: the chunked fp16 logits.  A 256-row
-            # piece is built by cuBLAS, streamed by our LSE kernel into LOGF,
-            # then freed before the next piece.
-            logf = torch.empty(npos, V, dtype=torch.float16, device=x.device)
+            # One 128-row fp16 logits piece at a time; no full logits buffer.
             lse = torch.empty(npos, dtype=torch.float32, device=x.device)
             amax = torch.empty(npos, dtype=torch.int32, device=x.device)
             nll = torch.empty(npos, dtype=torch.float32, device=x.device)
@@ -252,15 +245,14 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
                 end = min(start + _CH, npos)
                 nrows = end - start
                 logits = torch.mm(x[start:end], wt)
-                _ck_lse_store_kernel[(nrows,)](
+                _ck_lse_kernel[(nrows,)](
                     logits, tgt_in[start:end], lse[start:end],
                     amax[start:end], nll[start:end], ent[start:end],
-                    logf[start:end], V, BLOCK=_BLOCK,
-                    num_warps=2, num_stages=1,
+                    V, BLOCK=_BLOCK, num_warps=2, num_stages=1,
                 )
                 del logits
             loss = nll.sum() / den_val
-            ctx.save_for_backward(tgt_in, am_in, w16_in, lse, amax, logf, ent)
+            ctx.save_for_backward(x, tgt_in, am_in, w16_in, lse, amax, ent)
             ctx.K, ctx.V, ctx.den = K, V, den_val
             step = CKHeadStep(nll.view(B, S).detach())
             hook.step = step
@@ -270,7 +262,7 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
 
         @staticmethod
         def backward(ctx, grad_out):
-            tgt_b, am_b, w16_b, lse_b, amax_b, logf_b, ent_b = ctx.saved_tensors
+            x_b, tgt_b, am_b, w16_b, lse_b, amax_b, ent_b = ctx.saved_tensors
             dH = torch.empty(npos, ctx.K, dtype=torch.float16, device=tgt_b.device)
             # AMP/Accelerate may scale the scalar loss before calling us.  A
             # custom autograd Function must propagate that upstream gradient;
@@ -278,17 +270,19 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
             # even for GradScaler's 2^16, unlike scaling dH after the fact.
             scale = float(grad_out) if grad_out is not None else 1.0
             inv_den = scale / ctx.den
+            wt_b = w16_b.t()
             for a in range(0, npos, _CH):
                 nrows = min(_CH, npos - a)
+                logits = torch.mm(x_b[a:a + nrows], wt_b)
                 dl = torch.empty(nrows, ctx.V, dtype=torch.float16,
                                  device=tgt_b.device)
                 _ck_dlogits_kernel[((nrows + _BM - 1) // _BM, ctx.V // _BN)](
-                    logf_b[a:a + nrows], tgt_b[a:a + nrows], lse_b[a:a + nrows],
+                    logits, tgt_b[a:a + nrows], lse_b[a:a + nrows],
                     dl, nrows, inv_den, ctx.V,
                     BM=_BM, BN=_BN, num_warps=4, num_stages=2,
                 )
                 dH[a:a + nrows] = torch.mm(dl, w16_b)
-                del dl
+                del logits, dl
             am_sum = float(am_b.sum().item())
             ent_mean = float((ent_b * am_b).sum() / max(am_sum, 1.0))
             lab = tgt_b != -100
