@@ -11,6 +11,7 @@ import triton.language as tl
 
 _ORIGINAL_DEQUANT = None
 _ORIGINAL_MATMUL_FORWARD = None
+_ORIGINAL_MATMUL_BACKWARD = None
 _CACHEABLE = set()
 _DECODED = {}
 _PAIRED = {}
@@ -160,12 +161,14 @@ def patch_nf4_matmul():
     """Use our fused decode for the frozen fp16 forward as well as backward."""
     from bitsandbytes.autograd._functions import MatMul4Bit
     import torch.nn.functional as functional
-    global _ORIGINAL_MATMUL_FORWARD
+    global _ORIGINAL_MATMUL_FORWARD, _ORIGINAL_MATMUL_BACKWARD
 
     original = MatMul4Bit.forward
     if getattr(original, "_ck_is_ours", False):
         return
     _ORIGINAL_MATMUL_FORWARD = original
+    original_backward = MatMul4Bit.backward
+    _ORIGINAL_MATMUL_BACKWARD = original_backward
 
     def forward(ctx, A, B, out=None, bias=None, quant_state=None):
         if (not A.is_cuda or A.dtype != torch.float16 or A.numel() == 0 or B.numel() <= 1
@@ -176,7 +179,13 @@ def patch_nf4_matmul():
         decoded = decode_nf4(packed, quant_state)
         if decoded is None:
             return original(ctx, A, B, out, bias, quant_state)
-        output = functional.linear(A, decoded, bias)
+        from .ck_padding import projection_layout, gather_rows, scatter_rows
+        layout = projection_layout(A) if not B.requires_grad else None
+        if layout is None:
+            output = functional.linear(A, decoded, bias)
+        else:
+            output = scatter_rows(functional.linear(gather_rows(A, layout), decoded, bias), layout)
+            ctx._ck_projection_layout = layout
         if out is not None:
             out.copy_(output)
             output = out
@@ -188,5 +197,19 @@ def patch_nf4_matmul():
         ctx.tensors = (None, packed) if any(ctx.needs_input_grad[:2]) else (None, None)
         return output
 
+    def backward(ctx, grad_output):
+        layout = getattr(ctx, "_ck_projection_layout", None)
+        if layout is None:
+            return original_backward(ctx, grad_output)
+        from .ck_padding import gather_rows, scatter_rows
+        grad_A = None
+        if ctx.needs_input_grad[0]:
+            packed = ctx.tensors[1]
+            decoded = decode_nf4(packed, ctx.state)
+            grad = gather_rows(grad_output.to(ctx.dtype_A), layout)
+            grad_A = scatter_rows(torch.mm(grad, decoded), layout)
+        return grad_A, None, None, None, None
+
     forward._ck_is_ours = True
     MatMul4Bit.forward = staticmethod(forward)
+    MatMul4Bit.backward = staticmethod(backward)
