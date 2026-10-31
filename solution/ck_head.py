@@ -1,4 +1,4 @@
-"""K3 — compact chunked lm_head + CE (Triton LSE for metrics, PyTorch CE).
+"""K3 — compact chunked lm_head + CE (Triton loss, metrics and backward).
 
 The reference path materializes a full fp16 logits tensor (4 x 512 x 151936)
 plus fp32 copies for log_softmax / cross-entropy / entropy — a few GB of
@@ -12,8 +12,8 @@ the mask or by the shifted CE target:
   not the attention mask alone;
 * our Triton ``_ck_lse_kernel`` produces per-row logsumexp, NLL, entropy and
   argmax for those rows — the metric/token-loss path stays ours;
-* the training loss uses stock fp32 cross-entropy; its gradient uses the same
-  softmax math in Triton on the labelled rows only;
+* training loss reuses those fp32 NLL values instead of constructing a second
+  fp32 logits/log-softmax buffer; its gradient uses softmax math in Triton;
 * the backward recomputes the fp16 logits for the labelled rows and writes the
   fp16 softmax gradient ``(p - onehot) / den`` in 128-row pieces, then
   ``dH = dlogits_piece @ W16`` stays cuBLAS and is scattered back into the
@@ -32,18 +32,15 @@ slower on a T4 and its compile time alone breaks the wall clock.  No full
 logits buffer is stored; the backward recomputes one 128-row piece at a time.
 """
 
-from bisect import bisect_left
-
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# _CH — rows per head piece (a 128-row logits piece is the only large temp).
+# _CH — rows per head piece (only one fp16 logits piece is materialized).
 # _BLOCK — vocab elements per streaming step in the LSE kernel.
 _BN = 64
 _BK = 64
-_CH = 128
+_CH = 256
 _BLOCK = 256
 
 _W16 = {"key": None, "tensor": None}
@@ -57,22 +54,59 @@ def offload_frozen_head(lm):
     """Keep the exact fp32 master on CPU while the frozen head uses its cache.
 
     Called at the first labelled forward, after Accelerate has placed the
-    model. Shared embedding/head storage is deliberately excluded.
+    model. A shared embedding is supported only when its fp16 cache is exact.
     """
     weight = lm.lm_head.weight
-    if (not weight.is_cuda or weight.dtype != torch.float32
+    if (getattr(lm, "_ck_head_offload_rejected", False)
+            or not weight.is_cuda or weight.dtype != torch.float32
             or weight.requires_grad or not weight.is_contiguous()
             or weight.shape[0] % _BN or weight.shape[1] % _BK):
         return
-    embedding = lm.get_input_embeddings().weight
-    if embedding is weight or embedding.data_ptr() == weight.data_ptr():
-        return
-    _w16_for(weight)
+    embedding = lm.get_input_embeddings()
+    shared = embedding.weight is weight or embedding.weight.data_ptr() == weight.data_ptr()
+    compute_weight = _w16_for(weight)
+    if shared:
+        # k-bit preparation commonly upcasts an fp16 embedding to fp32.
+        # Only offload a shared master if the cached representation is exact:
+        # the lookup must reproduce the original fp32 embedding values.
+        if (embedding.weight.requires_grad or embedding.max_norm is not None
+                or not torch.equal(compute_weight.float(), weight)):
+            lm._ck_head_offload_rejected = True
+            return
+        if not hasattr(embedding, "_ck_orig_embedding_forward"):
+            import types
+            embedding._ck_orig_embedding_forward = embedding.forward
+
+            def embedding_forward(module, input):
+                if not getattr(lm, "_ck_head_offloaded", False):
+                    return module._ck_orig_embedding_forward(input)
+                ids = input.contiguous()
+                cached = lm._ck_head_compute_weight
+                out = torch.empty((*ids.shape, cached.shape[1]), device=ids.device,
+                                  dtype=torch.float32)
+                _ck_embedding_kernel[(triton.cdiv(out.numel(), 1024),)](
+                    ids, cached, out, out.numel(), cached.shape[1],
+                    cached.shape[0], BLOCK=1024, num_warps=4,
+                )
+                return out
+
+            embedding.forward = types.MethodType(embedding_forward, embedding)
+    lm._ck_head_compute_weight = compute_weight
     lm._ck_head_gpu_device = weight.device
     weight.data = weight.detach().cpu()
     _W16["key"] = _weight_key(weight)
     lm._ck_head_offloaded = True
     print("[ck] frozen fp32 head offloaded to CPU; fp16 compute copy on GPU", flush=True)
+
+
+@triton.jit
+def _ck_embedding_kernel(IDS, WEIGHT, OUT, N, H: tl.constexpr, V,
+                          BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    token = tl.load(IDS + i // H, i < N, other=0)
+    values = tl.load(WEIGHT + token * H + i % H,
+                     (i < N) & (token >= 0) & (token < V), other=0)
+    tl.store(OUT + i, values.to(tl.float32), i < N)
 
 
 def restore_frozen_head(lm):
@@ -172,16 +206,6 @@ def _ck_ce_grad_kernel(LOGITS, LSE, TARGET, DLOGITS, V, INV_DEN,
     target = tl.load(TARGET + row)
     grad = (tl.exp(x - lse) - (col == target).to(tl.float32)) * INV_DEN
     tl.store(DLOGITS + row * V + col, grad.to(tl.float16), mask=mask)
-
-
-@triton.jit
-def _ck_select_logits_kernel(LOGITS, ROWS, OUT, V, BLOCK: tl.constexpr):
-    """Gather labelled logits and convert them to fp32 for stock CE."""
-    row = tl.program_id(0)
-    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    source_row = tl.load(ROWS + row)
-    values = tl.load(LOGITS + source_row * V + col, mask=col < V, other=0.0)
-    tl.store(OUT + row * V + col, values.to(tl.float32), mask=col < V)
 
 
 def _w16_for(weight):
@@ -300,11 +324,6 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
         x_lab = x_keep.index_select(0, lab_pos)
         tgt_lab = tgt_keep.index_select(0, lab_pos).to(torch.long)
         idx_lab = idx_keep.index_select(0, lab_pos)
-        # Resolve chunk boundaries once. Repeating nonzero() for every piece
-        # forces a GPU/CPU synchronization each time; the sorted positions are
-        # small, so one transfer avoids those repeated synchronizations.
-        lab_pos_host = lab_pos.cpu().tolist()
-        lab_pos_in_chunk = lab_pos.remainder(_CH)
 
     w16 = _w16_for(weight)
     if w16 is None:
@@ -319,14 +338,12 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
     class _CKHeadFn(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, tgt_in, am_in, w16_in):
-            # One 128-row fp16 logits piece at a time; no full logits buffer.
-            # The LSE pass runs over every kept row (mask or real shifted
-            # target); the CE runs over the labelled rows of the same pieces.
+            # The same fp32 NLL values feed both loss and rewind. Ignored
+            # targets have zero NLL, matching cross_entropy(ignore_index=-100).
             lse = torch.empty(n_keep, dtype=torch.float32, device=x.device)
             amax = torch.empty(n_keep, dtype=torch.int32, device=x.device)
             nll = torch.empty(n_keep, dtype=torch.float32, device=x.device)
             ent = torch.empty(n_keep, dtype=torch.float32, device=x.device)
-            loss_sum = torch.zeros((), dtype=torch.float32, device=x.device)
             wt = w16_in.t()
             for start in range(0, n_keep, _CH):
                 end = min(start + _CH, n_keep)
@@ -337,22 +354,8 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
                     amax[start:end], nll[start:end], ent[start:end],
                     V, BLOCK=_BLOCK, num_warps=2, num_stages=1,
                 )
-                first_lab = bisect_left(lab_pos_host, start)
-                last_lab = bisect_left(lab_pos_host, end, first_lab)
-                n_lab_chunk = last_lab - first_lab
-                if n_lab_chunk:
-                    lab_rows = lab_pos_in_chunk[first_lab:last_lab]
-                    logits_lab = torch.empty((n_lab_chunk, V), dtype=torch.float32,
-                                             device=x.device)
-                    _ck_select_logits_kernel[(n_lab_chunk, triton.cdiv(V, 1024))](
-                        logits, lab_rows, logits_lab, V, BLOCK=1024, num_warps=4,
-                    )
-                    tgt_chunk = tgt_lab[first_lab:last_lab]
-                    loss_sum += F.cross_entropy(
-                        logits_lab, tgt_chunk, reduction="sum",
-                    )
                 del logits
-            loss = loss_sum / den_val
+            loss = nll.sum() / den_val
             token_loss = torch.zeros((B, S), dtype=torch.float32,
                                      device=x.device)
             token_loss.view(-1)[idx_keep] = nll

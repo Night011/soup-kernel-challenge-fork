@@ -54,6 +54,40 @@ def test_swiglu_matches_pytorch():
     torch.testing.assert_close(up.grad.float(), dup.float(), rtol=2e-3, atol=2e-3)
 
 
+def test_shared_frozen_head_offload():
+    """Shared fp32 embedding/master survives offload and stock restoration."""
+    from solution import ck_head
+
+    torch.manual_seed(6)
+    class SharedModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(512, 64, device="cuda")
+            self.embed.weight.data = self.embed.weight.data.half().float()
+            self.embed.weight.requires_grad_(False)
+            self.lm_head = torch.nn.Linear(64, 512, bias=False, device="cuda")
+            self.lm_head.weight = self.embed.weight
+
+        def get_input_embeddings(self):
+            return self.embed
+
+    model = SharedModel()
+    ids = torch.tensor([[0, 1, 511], [16, 70, 82]], device="cuda")
+    original = model.embed.weight.detach().clone()
+    reference = model.embed(ids)
+    ck_head.offload_frozen_head(model)
+    try:
+        assert model.embed.weight.device.type == "cpu"
+        assert model.embed.weight is model.lm_head.weight
+        out = model.embed(ids)
+        torch.testing.assert_close(out, reference, rtol=0, atol=0)
+        assert out.dtype == torch.float32
+    finally:
+        ck_head.restore_frozen_head(model)
+    torch.testing.assert_close(model.embed.weight, original, rtol=0, atol=0)
+    torch.testing.assert_close(model.embed(ids), reference, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("shape", [(2048, 1536), (3, 5, 1536)])
 def test_rmsnorm_matches_reference(dtype, shape):
