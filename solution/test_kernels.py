@@ -10,6 +10,27 @@ torch = pytest.importorskip("torch")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
 
+@pytest.mark.parametrize("base_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("scale", [2.0, 1.7])
+def test_lora_add_matches_pytorch(base_dtype, scale):
+    """Preserve both rounding points in PEFT's scale/add and its gradient."""
+    from solution.ck_lora import CKLoRAAddFn
+
+    torch.manual_seed(4)
+    base = torch.randn(3, 17, 1536, device="cuda", dtype=base_dtype)
+    update = torch.randn_like(base, dtype=torch.float16)
+    grad = torch.randn_like(base)
+    br, ur = base.clone().requires_grad_(), update.clone().requires_grad_()
+    ref = br + ur * scale
+    ref.backward(grad)
+    bo, uo = base.clone().requires_grad_(), update.clone().requires_grad_()
+    out = CKLoRAAddFn.apply(bo, uo, scale)
+    out.backward(grad)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    torch.testing.assert_close(bo.grad, br.grad, rtol=0, atol=0)
+    torch.testing.assert_close(uo.grad, ur.grad, rtol=0, atol=0)
+
+
 def test_swiglu_matches_pytorch():
     """The starter-derived tiled SwiGLU vs the fp32 PyTorch formula."""
     from solution.swiglu import swiglu
