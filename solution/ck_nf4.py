@@ -23,28 +23,61 @@ def clear_weight_cache():
     _PAIRED.clear()
 
 
-def paired_mlp_weights(gate_weight, up_weight):
-    """Concatenate exact gate/up matrices once, replacing their separate cache."""
-    gp, up = gate_weight.data_ptr(), up_weight.data_ptr()
-    if gp not in _CACHEABLE or up not in _CACHEABLE:
+def paired_mlp_weights(gate_weight, up_weight, states=None):
+    """Decode gate/up directly into a combined matrix, cached only if budgeted."""
+    if states is None:
+        states = [getattr(w, "quant_state", None) for w in (gate_weight, up_weight)]
+    if not can_pair_weights(gate_weight, up_weight, states):
         return None
-    gs, us = gate_weight.quant_state, up_weight.quant_state
+    gp, up = gate_weight.data_ptr(), up_weight.data_ptr()
+    cacheable = gp in _CACHEABLE and up in _CACHEABLE
+    gs, us = states
     version = (_cache_key(gate_weight, gs), _cache_key(up_weight, us))
-    cached = _PAIRED.get((gp, up))
+    cached = _PAIRED.get((gp, up)) if cacheable else None
     if cached is not None and cached[0] == version:
         return cached[1]
-    g = decode_nf4(gate_weight, gs)
-    u = decode_nf4(up_weight, us)
-    if g is None or u is None:
-        return None
-    combined = torch.cat((g, u), dim=0)
-    _DECODED.pop(gp, None)
-    _DECODED.pop(up, None)
-    _PAIRED[(gp, up)] = (version, combined)
+    n = gs.shape[0] * gs.shape[1]
+    combined = torch.empty((2 * gs.shape[0], gs.shape[1]),
+                            device=gate_weight.device, dtype=torch.float16)
+    _ck_nf4_pair_kernel[(triton.cdiv(n, 1024), 2)](
+        gate_weight, up_weight, gs.absmax, us.absmax, gs.code, us.code,
+        gs.state2.code if gs.nested else gs.absmax,
+        us.state2.code if us.nested else us.absmax,
+        gs.state2.absmax if gs.nested else gs.absmax,
+        us.state2.absmax if us.nested else us.absmax,
+        gs.offset if gs.nested else gs.absmax,
+        us.offset if us.nested else us.absmax,
+        combined, n, NESTED=gs.nested, BLOCK=1024, num_warps=4,
+        enable_fp_fusion=False,
+    )
+    if cacheable:
+        _DECODED.pop(gp, None)
+        _DECODED.pop(up, None)
+        _PAIRED[(gp, up)] = (version, combined)
     return combined
 
 
-def register_mlp_cache(lm, limit_bytes=1216 * 2**20):
+def can_pair_weights(gate, up, states=None):
+    if states is None:
+        states = [getattr(w, "quant_state", None) for w in (gate, up)]
+    for weight, state in zip((gate, up), states):
+        if (state is None or not weight.is_cuda or weight.dtype != torch.uint8
+                or not weight.is_contiguous() or state.dtype != torch.float16
+                or state.quant_type != "nf4" or state.blocksize != 64
+                or len(state.shape) != 2 or not state.absmax.is_cuda
+                or not state.code.is_cuda or state.code.numel() != 16):
+            return False
+        if state.nested and (state.state2.nested or state.state2.blocksize != 256
+                             or state.state2.dtype != torch.float32
+                             or not state.state2.absmax.is_cuda
+                             or not state.state2.code.is_cuda or not state.offset.is_cuda):
+            return False
+    return (states[0].nested == states[1].nested
+            and tuple(states[0].shape) == tuple(states[1].shape)
+            and gate.device == up.device)
+
+
+def register_mlp_cache(lm, limit_bytes=768 * 2**20):
     """Bound the cache and prioritize pairs which also fuse MLP matmuls."""
     clear_weight_cache()
     reserved = 0
@@ -95,6 +128,33 @@ def _ck_nf4_kernel(PACKED, ABSMAX, CODE4, CODE8, SCALE2, OFFSET, OUT, N,
     else:
         scale = tl.load(ABSMAX + block, i < N, other=0)
     tl.store(OUT + i, unit * scale, i < N)
+
+
+@triton.jit
+def _ck_nf4_pair_kernel(GATE, UP, AG, AU, C4G, C4U, C8G, C8U,
+                         S2G, S2U, OG, OU, OUT, N,
+                         NESTED: tl.constexpr, BLOCK: tl.constexpr):
+    part = tl.program_id(1)
+    if part == 0:
+        packed_ptr, absmax_ptr, code4_ptr = GATE, AG, C4G
+        code8_ptr, scale2_ptr, offset_ptr = C8G, S2G, OG
+    else:
+        packed_ptr, absmax_ptr, code4_ptr = UP, AU, C4U
+        code8_ptr, scale2_ptr, offset_ptr = C8U, S2U, OU
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    packed = tl.load(packed_ptr + i // 2, i < N, other=0).to(tl.int32)
+    code = tl.where(i % 2 == 0, packed >> 4, packed & 15)
+    unit = tl.load(code4_ptr + code)
+    block = i // 64
+    if NESTED:
+        scale_code = tl.load(absmax_ptr + block, i < N, other=0).to(tl.int32)
+        unit_scale = tl.load(code8_ptr + scale_code)
+        second_scale = tl.load(scale2_ptr + block // 256, i < N, other=0)
+        scale = unit_scale * second_scale
+        scale = scale + tl.load(offset_ptr)
+    else:
+        scale = tl.load(absmax_ptr + block, i < N, other=0)
+    tl.store(OUT + part * N + i, unit * scale, i < N)
 
 
 def decode_nf4(packed, state, out=None):
