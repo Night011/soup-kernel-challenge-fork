@@ -25,7 +25,8 @@ _RMS_WARNED = False
 
 
 @triton.jit
-def _ck_rms_fwd_kernel(X, W, Y, eps, H: tl.constexpr, BLOCK: tl.constexpr):
+def _ck_rms_fwd_kernel(X, W, Y, SAVED_X, RSTD, eps, H: tl.constexpr,
+                        BLOCK: tl.constexpr, SAVE_FP16: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     base = row * H
     offs = tl.arange(0, BLOCK)
@@ -35,6 +36,9 @@ def _ck_rms_fwd_kernel(X, W, Y, eps, H: tl.constexpr, BLOCK: tl.constexpr):
     r = tl.rsqrt(var + eps)
     y = w * (x * r)
     tl.store(Y + base + offs, y.to(Y.dtype.element_ty), offs < H)
+    tl.store(RSTD + row, r)
+    if SAVE_FP16:
+        tl.store(SAVED_X + base + offs, x.to(tl.float16), offs < H)
 
 
 # y_j = w_j * x_j * r, где r = (mean(x^2) + eps)^(-1/2).
@@ -46,16 +50,15 @@ def _ck_rms_fwd_kernel(X, W, Y, eps, H: tl.constexpr, BLOCK: tl.constexpr):
 # цикл уже пишет dx. Оба цикла идут по H с шагом BLOCK, чтобы не держать
 # весь вектор строки в регистрах.
 @triton.jit
-def _ck_rms_bwd_kernel(X, DY, W, DX, eps, H: tl.constexpr, BLOCK: tl.constexpr):
+def _ck_rms_bwd_kernel(X, DY, W, RSTD, DX, H: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     base = row * H
     offs = tl.arange(0, BLOCK)
     x = tl.load(X + base + offs, offs < H, other=0.0).to(tl.float32)
     dy = tl.load(DY + base + offs, offs < H, other=0.0).to(tl.float32)
     w = tl.load(W + offs, offs < H, other=0.0).to(tl.float32)
-    m = tl.sum(x * x, axis=0) / H
     s = tl.sum(x * w * dy, axis=0)
-    r = tl.rsqrt(m + eps)
+    r = tl.load(RSTD + row)
     # coef = r^3 / H; второе слагаемое — вклад производной r по x_k.
     coef = r * r * r / H
     dx = r * w * dy - coef * x * s
@@ -66,33 +69,38 @@ class CKRMSNormFn(torch.autograd.Function):
     """y = w * x * rsqrt(mean(x^2)+eps); output in the input's dtype, backward dx same."""
 
     @staticmethod
-    def forward(ctx, x, weight, eps, output_fp16=False):
+    def forward(ctx, x, weight, eps, output_fp16=False, save_fp16=False):
         rows = x.numel() // weight.numel()
         hidden = weight.numel()
         y = torch.empty_like(x, dtype=torch.float16 if output_fp16 else x.dtype).view(rows, hidden)
+        compact = bool(save_fp16 and x.dtype == torch.float32)
+        saved_x = torch.empty_like(x, dtype=torch.float16) if compact else x
+        rstd = torch.empty(rows, dtype=torch.float32, device=x.device)
         _ck_rms_fwd_kernel[(rows,)](
-            x, weight, y, eps, H=hidden, BLOCK=triton.next_power_of_2(hidden),
+            x, weight, y, saved_x, rstd, eps, H=hidden,
+            BLOCK=triton.next_power_of_2(hidden), SAVE_FP16=compact,
             num_warps=4, num_stages=2,
         )
-        ctx.save_for_backward(x, weight)
+        ctx.save_for_backward(saved_x, weight, rstd)
+        ctx.input_dtype = x.dtype
         ctx.eps = eps
         return y.view_as(x)
 
     @staticmethod
     def backward(ctx, grad_out):
-        x, weight = ctx.saved_tensors
+        x, weight, rstd = ctx.saved_tensors
         rows = x.numel() // weight.numel()
         hidden = weight.numel()
         grad = grad_out.contiguous().view(rows, hidden)
-        dx = torch.empty_like(x).view(rows, hidden)
+        dx = torch.empty_like(x, dtype=ctx.input_dtype).view(rows, hidden)
         _ck_rms_bwd_kernel[(rows,)](
-            x, grad, weight, dx, ctx.eps, H=hidden, BLOCK=triton.next_power_of_2(hidden),
+            x, grad, weight, rstd, dx, H=hidden, BLOCK=triton.next_power_of_2(hidden),
             num_warps=4, num_stages=2,
         )
-        return (dx.view_as(x), None, None, None)[:len(ctx.needs_input_grad)]
+        return (dx.view_as(x), None, None, None, None)[:len(ctx.needs_input_grad)]
 
 
-def ck_rmsnorm(x, weight, eps, output_fp16=False):
+def ck_rmsnorm(x, weight, eps, output_fp16=False, save_fp16=False):
     """Triton path when it applies (returns tensor), else None."""
     if not x.is_cuda or not x.is_contiguous():
         return None
@@ -105,7 +113,7 @@ def ck_rmsnorm(x, weight, eps, output_fp16=False):
         return None
     if not weight.is_contiguous():
         return None
-    return CKRMSNormFn.apply(x, weight, eps, output_fp16)
+    return CKRMSNormFn.apply(x, weight, eps, output_fp16, save_fp16)
 
 
 def patch_qwen2_rmsnorm():
@@ -122,6 +130,7 @@ def patch_qwen2_rmsnorm():
             out = ck_rmsnorm(
                 hidden_states, self.weight, self.variance_epsilon,
                 getattr(self, "_ck_output_fp16", False),
+                True,
             )
         except Exception as exc:  # noqa: BLE001 - never break the stock model
             if not _RMS_WARNED:
