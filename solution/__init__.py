@@ -2,11 +2,12 @@
 
 apply() is called once by the harness before Soup builds model/trainer:
 
-* `patch_qwen2_mlp`      — our 2-D tiled SwiGLU fwd+bwd (`solution/swiglu.py`).
+* `patch_qwen2_mlp`      — a tiled adaptation of the starter SwiGLU example;
+  its kernels are explicitly excluded from our own-kernel share.
 * `patch_qwen2_rmsnorm`  — K1: fused RMSNorm fwd+bwd (`solution/ck_rms.py`).
 * `patch_qwen2_rope`     — K2: fused rotary embedding fwd+bwd (`ck_rope.py`).
-* `integrate.apply_all`  — K3: compact chunked lm_head with our Triton LSE and
-  the stock fp32 CE gradient (`ck_head.py`), K4 batch edge trim, TRL
+* `integrate.apply_all`  — K3: compact chunked lm_head with stock fp32 CE and
+  our Triton loss-gradient kernels (`ck_head.py`), K4 batch edge trim, TRL
   metric/rewind wiring, and the hook that swaps the causal-LM forward at
   Soup's documented setup point.
 """

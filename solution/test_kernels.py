@@ -11,7 +11,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 
 
 def test_swiglu_matches_pytorch():
-    """Our 2-D tiled SwiGLU kernel vs the fp32 PyTorch formula."""
+    """The starter-derived tiled SwiGLU vs the fp32 PyTorch formula."""
     from solution.swiglu import swiglu
 
     torch.manual_seed(0)
@@ -133,7 +133,9 @@ def test_head_loss_matches_reference():
         reduction="none", ignore_index=-100,
     )
     ref_loss = nll[lab.reshape(-1)].sum() / num_items
-    ref_loss.backward()
+    # A non-unit upstream gradient checks that the custom backward propagates
+    # loss scaling instead of silently assuming a scale of one.
+    (ref_loss * 3.0).backward()
     ref_dh = hr.grad.clone()
     ref_loss_v = float(ref_loss.detach().item())
 
@@ -142,7 +144,7 @@ def test_head_loss_matches_reference():
     loss, step = head.ck_chunked_lm_loss(
         ho, labels, weights, am, num_items, hook)
     assert loss is not None, "head path must be engageable in this test"
-    loss.backward()
+    (loss * 3.0).backward()
 
     tol = 1e-3 if ref_loss_v < 2 else 2e-3
     assert abs(float(loss.detach().item()) - ref_loss_v) <= 3e-3 * max(1, ref_loss_v)
@@ -186,7 +188,7 @@ def test_smoke_full_qwen2_flow():
     from solution import integrate
     from transformers import AutoConfig, Qwen2ForCausalLM
 
-    solution.apply()  # same wiring as harness/_train.py: own SwiGLU + K1..K4
+    solution.apply()  # same wiring as harness/_train.py: example SwiGLU + K1..K4
 
     torch.manual_seed(0)
     cfg = AutoConfig.for_model(
@@ -250,7 +252,7 @@ def test_smoke_full_qwen2_flow():
 
 def test_head_real_geometry():
     """K3 at the exact challenge geometry (V=151936, K=1536, 4x512 tokens):
-    compact rows, stock CE, and the fp32 body -> fp16 head cast. Catches
+    compact rows, stock CE with a Triton backward, and the fp32-to-fp16 head cast. Catches
     head-path breakage in ~10 s instead of a full train roundtrip."""
     import solution.ck_head as head
 
