@@ -299,23 +299,26 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
 
         @staticmethod
         def backward(ctx, grad_out):
-            x, tgt_b, am_b, w16_b, lse_b, amax_b = ctx.saved_tensors
+            x, tgt_b, am_b, w16_b, starts_b, lse_b, amax_b = ctx.saved_tensors
             dH = torch.empty(npos, K, dtype=torch.float16, device=x.device)
             ent = torch.zeros(npos, dtype=torch.float32, device=x.device)
             inv_den = 1.0 / ctx.den
-            wt = w16_b.t()
-            for a in range(0, npos, _CH):
+            for pi in range(ctx.NP):
+                a = pi * _CH
                 nrows = min(_CH, npos - a)
-                logits = torch.mm(x[a:a + nrows], wt)
                 dl = torch.empty(nrows, ctx.V, dtype=torch.float16,
                                  device=x.device)
-                _ck_dlogits_kernel[((nrows + _BM - 1) // _BM, ctx.NT)](
-                    logits, tgt_b[a:a + nrows], am_b[a:a + nrows], lse_b[a:a + nrows],
-                    ent[a:a + nrows], dl, nrows, inv_den, ctx.V,
-                    BM=_BM, BN=_BN, num_warps=4, num_stages=2,
+                _ck_dlogits_kernel[(ctx.NT,)](
+                    x, w16_b, tgt_b, am_b, lse_b, ent, dl, a, nrows, inv_den,
+                    K, ctx.NT, MB=_CH // _BM, BM=_BM, BN=_BN, BK=_BK,
+                    num_warps=8, num_stages=2
                 )
                 dH[a:a + nrows] = torch.mm(dl, w16_b)
-                del dl, logits
+                del dl
+            # AMP/Accelerate may scale the scalar loss before calling us.  A
+            # custom autograd Function must propagate that upstream gradient;
+            # otherwise the optimizer later unscales an already-unscaled dH.
+            dH.mul_(grad_out.to(dtype=dH.dtype))
             am_sum = float(am_b.sum().item())
             ent_mean = float((ent * am_b).sum() / max(am_sum, 1.0))
             lab = tgt_b != -100
@@ -323,9 +326,9 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
             acc = float(((amax_b == tgt_b) & lab).sum().item()) / total \
                 if total > 0 else 0.0
             hook.on_backward_done(hook.trainer, ent_mean, acc)
-            return dH, None, None, None
+            return dH, None, None, None, None
 
-    loss = _CKHeadFn.apply(X, tgt, am, w16)
+    loss = _CKHeadFn.apply(X, tgt, am, w16, piece_starts)
     if hook.step is None:
         return None
     return loss, hook.step
