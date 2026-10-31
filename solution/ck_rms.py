@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 
 _RMS_BLOCK = 512
+_RMS_WARNED = False
 
 
 @triton.jit
@@ -42,6 +43,14 @@ def _ck_rms_fwd_kernel(X, W, Y, eps, H: tl.constexpr, BLOCK: tl.constexpr):
         tl.store(Y + base + d, y.to(Y.dtype.element_ty))
 
 
+# y_j = w_j * x_j * r, где r = (mean(x^2) + eps)^(-1/2).
+# Производная по x_k:
+#   dL/dx_k = w_k * dy_k * r
+#             - (r^3 / H) * x_k * sum_j (w_j * dy_j * x_j).
+# Второе слагаемое — это dr/dx_k = -(r^3 / H) * x_k, умноженное на сумму
+# по всем j. Поэтому первый цикл копит sum(x^2) и sum(w*dy*x), а второй
+# цикл уже пишет dx. Оба цикла идут по H с шагом BLOCK, чтобы не держать
+# весь вектор строки в регистрах.
 @triton.jit
 def _ck_rms_bwd_kernel(X, DY, W, DX, eps, H: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
@@ -59,8 +68,7 @@ def _ck_rms_bwd_kernel(X, DY, W, DX, eps, H: tl.constexpr, BLOCK: tl.constexpr):
     m = tl.sum(acc_xx, axis=0) / H
     s = tl.sum(acc_gx, axis=0)
     r = tl.rsqrt(m + eps)
-    # d/dx_j [ x_j * r(x) ] = r - x_j * (r^3 / H) * (2 x_j ... ) -- the exact
-    # derivative of r = (mean(x^2)+eps)^-1/2 is -(r^3 / H) * x_j.
+    # coef = r^3 / H; второе слагаемое — вклад производной r по x_k.
     coef = r * r * r / H
     for i in tl.static_range(H // BLOCK):
         d = i * BLOCK + offs
@@ -125,9 +133,19 @@ def patch_qwen2_rmsnorm():
         return
 
     def rms_forward(self, hidden_states):
-        out = ck_rmsnorm(
-            hidden_states, self.weight, self.variance_epsilon
-        )
+        global _RMS_WARNED
+        try:
+            out = ck_rmsnorm(
+                hidden_states, self.weight, self.variance_epsilon
+            )
+        except Exception as exc:  # noqa: BLE001 - never break the stock model
+            if not _RMS_WARNED:
+                _RMS_WARNED = True
+                import traceback
+                traceback.print_exc()
+                print(f"[ck] rmsnorm fallback: {exc.__class__.__name__}: {exc}",
+                      flush=True)
+            out = None
         if out is not None:
             return out
         return orig(self, hidden_states)
