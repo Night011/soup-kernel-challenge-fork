@@ -10,10 +10,36 @@ apply() is called once by the harness before Soup builds model/trainer:
   that swaps the causal-LM forward at Soup's documented setup point.
 """
 
-from .swiglu import patch_qwen2_mlp
-from .ck_rms import patch_qwen2_rmsnorm
-from .ck_rope import patch_qwen2_rope
-from . import integrate
+import os
+
+
+def _setup_triton_cache():
+    """Keep Triton's compiler cache on Kaggle's persistent volume.
+
+    The harness exports TRITON_CACHE_DIR for every measured run (a fresh
+    directory per run), so this is a no-op there and never reuses a prebuilt
+    cache.  In an interactive notebook the cache survives a restart.
+    """
+    if os.environ.get("TRITON_CACHE_DIR"):
+        return
+    root = "/kaggle/working"
+    if not os.path.isdir(root):
+        return
+    path = os.path.join(root, ".triton_cache")
+    try:
+        os.makedirs(path, exist_ok=True)
+        os.environ["TRITON_CACHE_DIR"] = path
+        print(f"[ck] triton cache: {path}", flush=True)
+    except OSError:
+        pass
+
+
+_setup_triton_cache()
+
+from .swiglu import patch_qwen2_mlp  # noqa: E402
+from .ck_rms import patch_qwen2_rmsnorm  # noqa: E402
+from .ck_rope import patch_qwen2_rope  # noqa: E402
+from . import integrate  # noqa: E402
 
 
 def apply():

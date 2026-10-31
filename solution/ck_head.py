@@ -10,37 +10,47 @@ Per forward step (B*S' rows, vocab V, hidden K):
                                (values are bit-identical to the autocast-cast
                                weight the fp16 reference matmul uses).
 2. ``_ck_lse_fwd_kernel``    — tiled Triton GEMM X(rows,K) @ W16(K,V): rows are
-                               processed in 256-row pieces, vocab in 128-wide
-                               tiles; each program keeps a 128-row block and
+                               processed in 256-row pieces, vocab in 64-wide
+                               tiles; each program keeps a 64-row block and
                                stores pmax/psum/pidx partials.
 3. ``_ck_lse_reduce_kernel`` — merges partials into per-row logsumexp and a
                                first-wins argmax.
 4. ``_ck_nll_kernel``        — logit_y = sum_k X[r,k] * W16[y_r,k] gathered dot
-                               (exact fp16 products, fp32 sums, the same value
-                               tensor cores produce) -> nll = logit_y - lse.
-5. ``_ck_dlogits_kernel``    — turns a temporary cuBLAS logits piece into its
-                               softmax gradient and entropy, without creating
-                               a full-batch logits tensor.
-Both large GEMMs use cuBLAS on a 256-row piece; only the softmax/metrics work
-is our Triton kernel.  A piece is freed before the next one is built.
+                               (exact fp16 products, fp32 sums, rounded to fp16
+                               like the reference logits) -> nll = lse - logit_y.
+5. ``_ck_dlogits_kernel``    — second GEMM sweep: per piece, recompute tile
+                               logits, exp(logit-lse), store the fp16 dlogits
+                               tile ((p - onehot)/den, zeros at ignored rows)
+                               and atomic-add the token entropy (p * log p).
+``dH = dlogits_piece @ W16`` stays a plain fp16 cuBLAS matmul, piece by piece,
+so piece state is freed immediately.
 
 den is the cross-entropy denominator the Trainer already computes
 (num_items_in_batch), so loss value and every gradient scale match the
 reference exactly. Per-token losses are exposed through a CKHeadStep so the
 rewind recorder can produce row losses without logits.
+
+Геометрия куска (chunking): полный батч содержит npos = B*S строк. Мы режем
+его на куски по _CH=256 строк. Внутри куска _CH/_BM=4 блока по _BM=64 строк,
+а словарь V режется на NT=V/_BN плиток по _BN=64 столбцов. Для каждого блока
+и плитки прямой проход хранит три частичных значения (max, sum(exp), argmax)
+в массивах размера (npos, NT); отдельный reduce-проход сливает их в один
+logsumexp на строку. Обратный проход заново считает те же логиты по кускам,
+поэтому полный тензор логитов (npos x V) не появляется ни в forward, ни в
+backward — максимум один кусок 256 x V живёт одновременно.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-# Геометрия куска: _CH строк — это _CH // _BM блоков по _BM строк;
-# словарь режется на NT плиток по _BN столбцов; K — на плитки по _BK.
+# _BM строк x _BN столбцов — плитка GEMM; _BK — плитка по скрытому размеру.
+# _CH — сколько строк обрабатывается за один кусок (должно делиться на _BM).
 # Имена короткие, потому что они уходят в constexpr-параметры Triton.
 _BM = 64    # GEMM row block
 _BN = 64    # vocab tile
 _BK = 64    # hidden tile
-_CH = 256   # rows per piece (two _BM row blocks)
+_CH = 256   # rows per piece (four _BM row blocks)
 
 _W16 = {"key": None, "tensor": None}
 
@@ -124,31 +134,43 @@ def _ck_nll_kernel(X, W16, TGT, LSE, NLL, n_rows, K, BM: tl.constexpr,
         w = tl.load(W16 + y_safe[:, None] * K + (k0 + oe)[None, :],
                     mask=ymask[:, None], other=0.0).to(tl.float32)
         acc += tl.sum(x * w, axis=1)
+    # The reference logits are fp16: round the gathered dot once, exactly like
+    # the GEMM epilogue, before subtracting it from logsumexp.
+    acc = acc.to(tl.float16).to(tl.float32)
     nll = tl.where(ymask, tl.load(LSE + rows, mask=rmask, other=0.0) - acc, 0.0)
     tl.store(NLL + rows, nll, mask=rmask)
 
 
 @triton.jit
-def _ck_dlogits_kernel(LOGITS, TGT, AM, LSE, ENT, DL, nrows, inv_den, V,
-                       BM: tl.constexpr, BN: tl.constexpr):
-    rb = tl.program_id(0)
-    nt = tl.program_id(1)
-    rows = rb * BM + tl.arange(0, BM)
-    rmask = rows < nrows
+def _ck_dlogits_kernel(X, W16, TGT, AM, LSE, ENT, DL, pstart, nrows,
+                       inv_den, K, NT,
+                       MB: tl.constexpr, BM: tl.constexpr,
+                       BN: tl.constexpr, BK: tl.constexpr):
+    nt = tl.program_id(0)
     vw = nt * BN + tl.arange(0, BN)
-    lg = tl.load(LOGITS + rows[:, None] * V + vw[None, :],
-                 mask=rmask[:, None], other=0.0).to(tl.float32)
-    lse = tl.load(LSE + rows, mask=rmask, other=0.0)
-    p = tl.exp(lg - lse[:, None])
-    tgt = tl.load(TGT + rows, mask=rmask, other=-100)
-    labelled = (tgt != -100) & rmask
-    am = tl.load(AM + rows, mask=rmask, other=0.0)
-    contrib = tl.sum(p * (lse[:, None] - lg) * am[:, None], axis=1)
-    tl.atomic_add(ENT + rows, contrib, mask=rmask)
-    onehot = (vw[None, :] == tgt[:, None]).to(tl.float32)
-    d = tl.where(labelled[:, None], (p - onehot) * inv_den, 0.0)
-    tl.store(DL + rows[:, None] * V + vw[None, :], d.to(tl.float16),
-             mask=rmask[:, None])
+    for mb in tl.static_range(MB):
+        rows = pstart + mb * BM + tl.arange(0, BM)
+        rmask = rows < (pstart + nrows)
+        oe = tl.arange(0, BK)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            x = tl.load(X + rows[:, None] * K + (k0 + oe)[None, :],
+                        mask=rmask[:, None], other=0.0)
+            w = tl.load(W16 + vw[:, None] * K + (k0 + oe)[None, :])
+            acc = tl.dot(x, tl.trans(w), acc)
+        lg = acc.to(tl.float16).to(tl.float32)
+        lse = tl.load(LSE + rows, mask=rmask, other=0.0)
+        p = tl.exp(lg - lse[:, None])
+        tgt = tl.load(TGT + rows, mask=rmask, other=-100)
+        labelled = (tgt != -100) & rmask
+        am = tl.load(AM + rows, mask=rmask, other=0.0)
+        contrib = tl.sum(p * (lse[:, None] - lg) * am[:, None], axis=1)
+        tl.atomic_add(ENT + rows, contrib, mask=rmask)
+        onehot = (vw[None, :] == tgt[:, None]).to(tl.float32)
+        d = tl.where(labelled[:, None], (p - onehot) * inv_den, 0.0)
+        dl_row = rows - pstart
+        tl.store(DL + dl_row[:, None] * (NT * BN) + vw[None, :],
+                 d.to(tl.float16), mask=rmask[:, None])
 
 
 def _w16_for(weight):
@@ -241,7 +263,15 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
         am = attention_mask.reshape(-1).to(torch.float32)
     else:
         am = torch.ones(npos, dtype=torch.float32, device=hidden.device)
+    # Куски по _CH строк: последний кусок может быть короче, поэтому границы
+    # храним в STARTS (NP+1 значений), а не вычисляем их в ядре.
+    starts = [p for p in range(0, npos, _CH)]
+    if starts[-1] != npos:
+        starts.append(npos)
+    NP = len(starts) - 1
+    piece_starts = torch.tensor(starts, dtype=torch.int32, device=hidden.device)
     NT = V // _BN
+    NMB = NP * (_CH // _BM)
     w16 = _w16_for(weight)
     if w16 is None:
         return None
@@ -254,31 +284,32 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
 
     class _CKHeadFn(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, x, tgt_in, am_in, w16_in):
+        def forward(ctx, x, tgt_in, am_in, w16_in, starts_in):
+            # Частичные max/sum/argmax по каждой (строка, плитка словаря).
+            # NMB*_BM >= npos: лишние строки замаскированы в reduce-ядре.
+            pmax = torch.empty(NMB * _BM, NT, dtype=torch.float32,
+                               device=x.device)
+            psum = torch.empty(NMB * _BM, NT, dtype=torch.float32,
+                               device=x.device)
+            pidx = torch.empty(NMB * _BM, NT, dtype=torch.int32,
+                               device=x.device)
+            _ck_lse_fwd_kernel[(NP, NT)](
+                x, w16_in, starts_in, pmax, psum, pidx, K, NT,
+                MB=_CH // _BM, BM=_BM, BN=_BN, BK=_BK, num_warps=8, num_stages=2
+            )
             lse = torch.empty(npos, dtype=torch.float32, device=x.device)
             amax = torch.empty(npos, dtype=torch.int32, device=x.device)
             nll = torch.empty(npos, dtype=torch.float32, device=x.device)
-            wt = w16_in.t()
-            # cuBLAS is substantially faster than a handwritten large-vocab
-            # GEMM on a T4.  Each temporary is only a 256-row piece, preserving
-            # K3's logits-memory advantage.
-            for start in range(0, npos, _CH):
-                end = min(start + _CH, npos)
-                logits = torch.mm(x[start:end], wt)
-                logits_f = logits.float()
-                piece_lse = torch.logsumexp(logits_f, dim=1)
-                target = tgt_in[start:end]
-                valid = target != -100
-                safe_target = target.clamp(min=0, max=V - 1).to(torch.long)
-                target_logits = logits_f.gather(1, safe_target[:, None]).squeeze(1)
-                lse[start:end].copy_(piece_lse)
-                amax[start:end].copy_(logits.argmax(dim=1))
-                nll[start:end].copy_(torch.where(valid, piece_lse - target_logits,
-                                                   torch.zeros_like(piece_lse)))
-                del target_logits, safe_target, valid, piece_lse, logits_f, logits
+            _ck_lse_reduce_kernel[(NMB,)](
+                pmax, psum, pidx, lse, amax, NT, npos, BM=_BM, num_warps=4
+            )
+            _ck_nll_kernel[(NMB,)](
+                x, w16_in, tgt_in, lse, nll, npos, K, BM=_BM, BK=_BK,
+                num_warps=4
+            )
             loss = nll.sum() / den_val
             ctx.save_for_backward(x, tgt_in, am_in, w16_in, lse, amax)
-            ctx.NT, ctx.den, ctx.K, ctx.V = NT, den_val, K, V
+            ctx.NP, ctx.NT, ctx.den, ctx.K, ctx.V = NP, NT, den_val, K, V
             step = CKHeadStep(nll.view(B, S).detach())
             hook.step = step
             if hook.trainer is not None:
@@ -290,24 +321,30 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
             x, tgt_b, am_b, w16_b, lse_b, amax_b = ctx.saved_tensors
             dH = torch.empty(npos, K, dtype=torch.float16, device=x.device)
             ent = torch.zeros(npos, dtype=torch.float32, device=x.device)
-            inv_den = 1.0 / ctx.den
-            wt = w16_b.t()
-            for a in range(0, npos, _CH):
-                nrows = min(_CH, npos - a)
-                logits = torch.mm(x[a:a + nrows], wt)
-                dl = torch.empty(nrows, ctx.V, dtype=torch.float16,
-                                 device=x.device)
-                _ck_dlogits_kernel[((nrows + _BM - 1) // _BM, ctx.NT)](
-                    logits, tgt_b[a:a + nrows], am_b[a:a + nrows], lse_b[a:a + nrows],
-                    ent[a:a + nrows], dl, nrows, inv_den, ctx.V,
-                    BM=_BM, BN=_BN, num_warps=4, num_stages=2,
-                )
-                dH[a:a + nrows] = torch.mm(dl, w16_b)
-                del dl, logits
             # AMP/Accelerate may scale the scalar loss before calling us.  A
             # custom autograd Function must propagate that upstream gradient;
             # otherwise the optimizer later unscales an already-unscaled dH.
-            dH.mul_(grad_out.to(dtype=dH.dtype))
+            # Multiplying inv_den (a small number) is safer than scaling the
+            # fp16 dH afterwards: dlogits ~ (p - onehot)/den, so the scaled
+            # values stay far below the fp16 range even for GradScaler's 2^16.
+            scale = float(grad_out) if grad_out is not None else 1.0
+            inv_den = scale / ctx.den
+            for pi in range(ctx.NP):
+                a = pi * _CH
+                nrows = min(_CH, npos - a)
+                dl = torch.empty(nrows, ctx.V, dtype=torch.float16,
+                                 device=x.device)
+                # Сетка (NT,): каждый program обрабатывает одну плитку словаря
+                # для всех _CH/_BM блоков строк куска; MB — constexpr, поэтому
+                # цикл по блокам разворачивается.  Это fused-версия: внутри
+                # считается GEMM X @ W16^T, softmax и запись dlogits.
+                _ck_dlogits_kernel[(ctx.NT,)](
+                    x, w16_b, tgt_b, am_b, lse_b, ent, dl, a, nrows, inv_den,
+                    K, ctx.NT, MB=_CH // _BM, BM=_BM, BN=_BN, BK=_BK,
+                    num_warps=8, num_stages=2
+                )
+                dH[a:a + nrows] = torch.mm(dl, w16_b)
+                del dl
             am_sum = float(am_b.sum().item())
             ent_mean = float((ent * am_b).sum() / max(am_sum, 1.0))
             lab = tgt_b != -100
@@ -315,9 +352,9 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
             acc = float(((amax_b == tgt_b) & lab).sum().item()) / total \
                 if total > 0 else 0.0
             hook.on_backward_done(hook.trainer, ent_mean, acc)
-            return dH, None, None, None
+            return dH, None, None, None, None
 
-    loss = _CKHeadFn.apply(X, tgt, am, w16)
+    loss = _CKHeadFn.apply(X, tgt, am, w16, piece_starts)
     if hook.step is None:
         return None
     return loss, hook.step
