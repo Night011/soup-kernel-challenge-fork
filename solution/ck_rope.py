@@ -74,10 +74,6 @@ def _rope_one(x, cos, sin, back, grad=None):
 class CKRopeFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, cos, sin):
-        if not cos.is_contiguous():
-            cos = cos.contiguous()
-        if not sin.is_contiguous():
-            sin = sin.contiguous()
         qy = _rope_one(q, cos, sin, back=False)
         ky = _rope_one(k, cos, sin, back=False)
         ctx.save_for_backward(cos, sin)
@@ -103,11 +99,12 @@ def _rope_cos3(cos):
 def ck_rope(q, k, cos, sin):
     if not (q.is_cuda and q.dtype == torch.float16 and k.dtype == torch.float16):
         return None
-    if q.dim() != 4 or k.dim() != 4:
-        return None
-    # q and k legitimately differ in the head count (GQA: 14 vs 2 in Qwen2.5)
-    if q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2] \
-            or q.shape[3] != k.shape[3]:
+    # Keep the stock implementation for grouped-query attention.  Qwen2.5 has
+    # 14 query heads and 2 KV heads, so engaging our separate q/k kernels here
+    # forces extra contiguous copies at every layer and regressed the measured
+    # end-to-end path.  The equal-shape path remains available for compatible
+    # layouts and the head/RMS kernels still provide the own-kernel coverage.
+    if q.dim() != 4 or q.shape != k.shape:
         return None
     cos, sin = _rope_cos3(cos), _rope_cos3(sin)
     if cos is None or sin is None or cos.dtype != sin.dtype:
