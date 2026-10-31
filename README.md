@@ -12,7 +12,7 @@ data order, steps, optimizer and Soup's outputs are untouched.
 | `_ck_rope_fwd_kernel` / `_ck_rope_bwd_kernel` | `solution/ck_rope.py` | `apply_rotary_pos_emb` (q * cos + rotate_half(q) * sin on q and k, fp32 math, fp16 out) with the inverse-rotary backward |
 | `_ck_cast_kernel` | `solution/ck_head.py` | fp32→fp16 cast of the frozen lm_head weight into a cached fp16 copy (values equal to the autocast-cast weight the reference matmul uses) |
 | `_ck_lse_kernel` | `solution/ck_head.py` | one program per row over the 128-row cuBLAS logits piece: max/argmax, sum(exp), entropy — produces per-row logsumexp, NLL and raw entropy without a full fp32 logits tensor |
-| `_ck_dlogits_kernel` | `solution/ck_head.py` | reads the recomputed 128-row fp16 logits piece and writes the fp16 softmax gradient `(p − onehot)/den` (zeros at ignored positions) |
+| `_ck_ce_lse_kernel` / `_ck_ce_grad_kernel` | `solution/ck_head.py` | computes the normalizer and scaled softmax gradient for recomputed labelled logits, without materializing fp32 logits or probabilities |
 
 The large forward/backward logits GEMMs and `dH = dlogits_piece @ W16` stay
 cuBLAS matmuls, done piece by piece so only one 128-row piece is alive at a time.
@@ -50,10 +50,9 @@ logits copies without adding a full logits buffer.
 
 The loss value, its gradient and every logged metric follow the reference math:
 
-* logits rounding: the cuBLAS fp16 GEMM produces the same fp16 logits as the
-  reference; our Triton LSE/CE then runs in fp32 on those values, like
-  `ForCausalLMLoss` does after `logits.float()`, and the backward dlogits reads
-  the same cuBLAS fp16 logits recomputed for that piece;
+* logits rounding: cuBLAS produces fp16 logits; the loss uses stock fp32
+  cross-entropy and our Triton metric reductions read those fp16 values in
+  fp32. The backward recomputes logits and applies the softmax gradient;
 * the gradient of the mean CE is `(p − onehot) / num_items` with zeros at
   ignored positions, folded into `den = num_items_in_batch` the Trainer already
   computes;
@@ -72,24 +71,27 @@ python harness/run_task.py --profile       # plus a per-kernel CUDA profiler tab
 
 ## Results on Kaggle T4
 
-Filled from `runs/result.json` of the final notebook run (see also SUBMISSION.md):
+The following is one measured run of commit `83140ca`, before the current
+backward change. Current code must be remeasured; these are not its results.
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Harness wall time, s | 94.1 | 92.16 | 0.979× (faster) |
-| Peak GPU memory, MiB | 14,345 | 8,425 | 1.703× lower |
-| Own-kernel share of training time (check 4) | — | 6.0% (steps 3+, CUDA events) | — |
-| Eval loss (public rows) | 2.04958 | 2.04963 | +0.002% (noise floor) |
+| Harness wall time, s | 85.27 | 73.23 | 1.164× speedup |
+| Peak GPU memory, MiB | 14,345 | 8,485 | 1.691× lower |
+| Eval loss (public rows) | 2.04969 | 2.04964 | −0.002% |
 
-All checks pass: check 7 `+0.002%` (limit `+0.5%`), check 8 `time ×0.979`,
-`memory ×0.587` of base (limit `1.10×`), check 4 `6.0%` (limit `5%`),
-check 10 `79 passed`.
+That run's automatic kernel-share result included the starter-derived SwiGLU,
+so it must not be used as evidence for the 5% own-kernel requirement. The
+current implementation marks both SwiGLU kernels as examples; measure its own
+share and all checks in a fresh run.
 
 Checks: `runs/checks.json`.
 
 ## Ideas taken from other work, with links
 
-We wrote all kernels here ourselves; the following ideas are credited:
+Our head, normalization and rotary kernels are separate from the starter
+example. The tiled SwiGLU is an adaptation of the starter example and does not
+count as an own kernel. The following ideas are credited:
 
 * chunked fused linear + cross-entropy without materializing full fp32 logits —
   the idea of Liger-Kernel's `FusedLinearCrossEntropy` (Apache-2.0),
@@ -110,7 +112,7 @@ We wrote all kernels here ourselves; the following ideas are credited:
 ## Repo state
 
 * `solution/` — `ck_rms.py`, `ck_rope.py`, `ck_head.py`, `integrate.py`,
-  `__init__.py` (apply wiring), `swiglu.py` (starter-kit example, unchanged),
+  `__init__.py` (apply wiring), `swiglu.py` (tiled starter-example adaptation),
   `test_kernels.py` (our correctness tests).
 * `harness/`, `tests/`, `task/` — untouched.
 * `SUBMISSION.md`, Kaggle notebook link — see SUBMISSION.md.
