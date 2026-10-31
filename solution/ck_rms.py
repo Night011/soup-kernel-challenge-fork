@@ -83,10 +83,10 @@ class CKRMSNormFn(torch.autograd.Function):
     """y = w * x * rsqrt(mean(x^2)+eps); output in the input's dtype, backward dx same."""
 
     @staticmethod
-    def forward(ctx, x, weight, eps):
+    def forward(ctx, x, weight, eps, output_fp16=False):
         rows = x.numel() // weight.numel()
         hidden = weight.numel()
-        y = torch.empty_like(x).view(rows, hidden)
+        y = torch.empty_like(x, dtype=torch.float16 if output_fp16 else x.dtype).view(rows, hidden)
         _ck_rms_fwd_kernel[(rows,)](
             x, weight, y, eps, H=hidden, BLOCK=_RMS_BLOCK, num_warps=4, num_stages=2
         )
@@ -105,10 +105,10 @@ class CKRMSNormFn(torch.autograd.Function):
             x, grad, weight, dx, ctx.eps, H=hidden, BLOCK=_RMS_BLOCK,
             num_warps=4, num_stages=2,
         )
-        return dx.view_as(x), None, None
+        return (dx.view_as(x), None, None, None)[:len(ctx.needs_input_grad)]
 
 
-def ck_rmsnorm(x, weight, eps):
+def ck_rmsnorm(x, weight, eps, output_fp16=False):
     """Triton path when it applies (returns tensor), else None."""
     if not x.is_cuda or not x.is_contiguous():
         return None
@@ -121,7 +121,7 @@ def ck_rmsnorm(x, weight, eps):
         return None
     if not weight.is_contiguous():
         return None
-    return CKRMSNormFn.apply(x, weight, eps)
+    return CKRMSNormFn.apply(x, weight, eps, output_fp16)
 
 
 def patch_qwen2_rmsnorm():
@@ -136,7 +136,8 @@ def patch_qwen2_rmsnorm():
         global _RMS_WARNED
         try:
             out = ck_rmsnorm(
-                hidden_states, self.weight, self.variance_epsilon
+                hidden_states, self.weight, self.variance_epsilon,
+                getattr(self, "_ck_output_fp16", False),
             )
         except Exception as exc:  # noqa: BLE001 - never break the stock model
             if not _RMS_WARNED:

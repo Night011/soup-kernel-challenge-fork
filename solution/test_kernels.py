@@ -158,6 +158,25 @@ def test_rope_matches_reference(cos_dtype):
     torch.testing.assert_close(ko.grad.float(), gk.float(), rtol=2e-2, atol=2e-2)
 
 
+def test_rmsnorm_fp16_projection_boundary():
+    """Direct fp16 output vs fp32 RMSNorm immediately autocast by a projection."""
+    from solution.ck_rms import CKRMSNormFn
+
+    torch.manual_seed(8)
+    x = torch.randn(3, 17, 1536, device="cuda", dtype=torch.float32)
+    w = torch.randn(1536, device="cuda", dtype=torch.float32)
+    dy = torch.randn_like(x, dtype=torch.float16)
+    xr = x.clone().requires_grad_()
+    ref = (w * xr * torch.rsqrt(xr.square().mean(-1, keepdim=True) + 1e-6)).half()
+    ref.backward(dy)
+    xo = x.clone().requires_grad_()
+    out = CKRMSNormFn.apply(xo, w, 1e-6, True)
+    out.backward(dy)
+    assert out.dtype == torch.float16
+    torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(xo.grad, xr.grad, rtol=2e-3, atol=2e-3)
+
+
 def test_head_loss_matches_reference():
     """K3: compact chunked head + stock fp32 CE vs full fp16 logits + CE."""
     import solution.ck_head as head
