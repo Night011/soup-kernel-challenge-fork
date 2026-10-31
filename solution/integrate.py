@@ -465,20 +465,27 @@ def wrap_setup_transformers():
                 and str(getattr(self, "device", "")).startswith("cuda")
                 and str(getattr(tcfg, "quantization", "")) == "4bit"):
             from concurrent.futures import ThreadPoolExecutor
-            from .ck_compile import prepare_model_name
+            from .ck_compile import prepare_model_name, prepared_for_model
             lora_cfg = getattr(tcfg, "lora", None)
             scale = float(getattr(lora_cfg, "alpha", 32)) / max(1, int(getattr(lora_cfg, "r", 16)))
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ck_setup") as pool:
-                future = pool.submit(prepare_model_name, cfg.base, scale)
+            if prepared_for_model(cfg.base, scale):
                 out = orig(self, cfg, tcfg)
-                try:
-                    prepared = future.result()
-                    lm = _causal_lm_of(self.model)
-                    if lm is not None:
-                        lm._ck_kernels_prepared = prepared
-                    print("[ck] compiler threads joined before model setup returned", flush=True)
-                except Exception as exc:
-                    print(f"[ck] compiler overlap fallback: {type(exc).__name__}", flush=True)
+                lm = _causal_lm_of(self.model)
+                if lm is not None:
+                    lm._ck_kernels_prepared = True
+                print("[ck] model setup reuses exact model/scale preparation from apply", flush=True)
+            else:
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ck_setup") as pool:
+                    future = pool.submit(prepare_model_name, cfg.base, scale)
+                    out = orig(self, cfg, tcfg)
+                    try:
+                        prepared = future.result()
+                        lm = _causal_lm_of(self.model)
+                        if lm is not None:
+                            lm._ck_kernels_prepared = prepared
+                        print("[ck] compiler threads joined before model setup returned", flush=True)
+                    except Exception as exc:
+                        print(f"[ck] compiler overlap fallback: {type(exc).__name__}", flush=True)
         else:
             out = orig(self, cfg, tcfg)
         try:

@@ -72,6 +72,9 @@ class _PairedFrozenMLP(torch.autograd.Function):
             BM=_SW_BM, BN=_SW_BN, COMPRESSED=ctx.compress, PACK=PACK_BLOCK,
             num_warps=8, num_stages=2,
         )
+        del gate, up, grad_activation
+        if ctx.recompute:
+            del gu
         if wgu is None:
             wgu = ck_nf4.paired_mlp_weights(packed_gate, packed_up, ctx.pair_states)
         dx = torch.mm(dgu, wgu)

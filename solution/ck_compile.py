@@ -13,6 +13,15 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 import triton
 
+FIXED_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+FIXED_SCALE = 2.0
+_PREPARED_MODELS = set()
+
+
+def prepared_for_model(name, scale):
+    """Reuse only preparation of this exact model and LoRA scale in this process."""
+    return (str(name), float(scale)) in _PREPARED_MODELS
+
 
 def prepare_kernels(lm):
     if getattr(lm, "_ck_kernels_prepared", False):
@@ -31,7 +40,10 @@ def prepare_kernels(lm):
 
 def prepare_model_name(name, scale):
     from transformers import AutoConfig
-    return prepare_config(AutoConfig.from_pretrained(name), scale)
+    prepared = prepare_config(AutoConfig.from_pretrained(name), scale)
+    if prepared:
+        _PREPARED_MODELS.add((str(name), float(scale)))
+    return prepared
 
 
 def prepare_config(cfg, scale=2.0):
@@ -62,7 +74,6 @@ def prepare_config(cfg, scale=2.0):
         add(rms._ck_rms_bwd_kernel, (half, output, f, f, f),
             H=h, BLOCK=block, num_stages=2)
     add(head._ck_cast_kernel, (f, half, vocab * h), BLOCK=8192, num_warps=8)
-    add(head._ck_head_exact_kernel, (f, half, i32, vocab * h), BLOCK=8192, num_warps=8)
     add(head._ck_head_exact_kernel, (f, f, i32, vocab * h), BLOCK=8192, num_warps=8)
     add(head._ck_embedding_kernel, (i64, half, f, 1024 * h, h, vocab), BLOCK=1024)
     add(head._ck_lse_kernel, (f, i32, f, i32, f, f, vocab), BLOCK=4096, num_stages=1)
@@ -82,31 +93,27 @@ def prepare_config(cfg, scale=2.0):
             COMPACT=compact, BLOCK=1024)
         add(dropout._ck_dropout_bwd_kernel, (half, u8, f, 1024 * h, 1.0 / 0.95, i32 if compact else u8, h),
             COMPACT=compact, BLOCK=1024)
-    add(activation._ck_pack_activations_kernel, (half, half, i8, i8, f, f, 1024 * width),
-        COLS=width, STRIDE=2 * width, BLOCK=activation.PACK_BLOCK)
     for rows in (1024, 1032, 1023):
         add(swiglu.example_swiglu_fwd_kernel, (half, half, half, rows, width, 2 * width),
             BM=swiglu._SW_BM, BN=swiglu._SW_BN, num_warps=8, num_stages=2)
-        add(swiglu.example_swiglu_bwd_kernel,
-            (half, i8, i8, f, f, half, half, rows, width, width, 2 * width),
-            BM=swiglu._SW_BM, BN=swiglu._SW_BN, COMPRESSED=True,
-            PACK=activation.PACK_BLOCK, num_warps=8, num_stages=2)
         add(swiglu.example_swiglu_bwd_kernel,
             (half, half, half, half, half, half, half, rows, width, 2 * width, 2 * width),
             BM=swiglu._SW_BM, BN=swiglu._SW_BN, COMPRESSED=False,
             PACK=activation.PACK_BLOCK, num_warps=8, num_stages=2)
     add(padding._ck_mlp_residual_kernel, (f, half, i32, f, 1024 * h), H=h, BLOCK=1024)
     for source in (f, half):
-        add(padding._ck_gather_rows_kernel, (source, i64, half, 1024 * h), H=h, BLOCK=1024)
+        # gather_rows allocates with hidden.new_empty, retaining its dtype.
+        add(padding._ck_gather_rows_kernel, (source, i64, source, 1024 * h), H=h, BLOCK=1024)
     kv = (getattr(cfg, "head_dim", None) or h // cfg.num_attention_heads) * cfg.num_key_value_heads
     for columns in sorted({h, kv}):
         add(padding._ck_scatter_rows_kernel, (half, i32, half, 1024 * columns),
             H=columns, BLOCK=1024)
     add(padding._ck_scatter_rows_kernel, (f, i32, f, 1024 * h), H=h, BLOCK=1024)
-    add(residual._ck_residual_norm_fwd_kernel, (f, half, f, i32, f, half, half, f, eps),
-        H=h, BLOCK=block)
-    add(residual._ck_residual_norm_bwd_kernel, (f, half, f, i32, half, f, f, half),
-        H=h, BLOCK=block)
+    for attention_type in (half, f):
+        add(residual._ck_residual_norm_fwd_kernel,
+            (f, attention_type, f, i32, f, half, half, f, eps), H=h, BLOCK=block)
+        add(residual._ck_residual_norm_bwd_kernel,
+            (f, half, f, i32, half, f, f, attention_type), H=h, BLOCK=block)
     hq, hk = cfg.num_attention_heads, cfg.num_key_value_heads
     dim = getattr(cfg, "head_dim", None) or h // hq
     for backward in (False, True):

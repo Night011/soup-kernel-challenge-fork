@@ -73,6 +73,7 @@ def packed_transformer(model, input_ids, attention_mask, position_ids,
     from transformers.models.qwen2 import modeling_qwen2 as qm
     from transformers.modeling_outputs import BaseModelOutputWithPast
     from .ck_attention import _PackQKV, _NativeVarlen
+    from .ck_residual_norm import residual_compact_norm
 
     full = model.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
     batch, sequence, hidden = full.shape
@@ -87,6 +88,7 @@ def packed_transformer(model, input_ids, attention_mask, position_ids,
     count = rows.numel()
     identity = layout["packed_rows"]
     packed_inverse = layout["packed_inverse"]
+    norm_layout = (identity, (1, count), packed_inverse)
     with packed_lora_layout(row_layout):
         for layer in model.layers:
             residual = x
@@ -100,8 +102,14 @@ def packed_transformer(model, input_ids, attention_mask, position_ids,
             q, k, v = _PackQKV.apply(q, k, v, identity, packed_inverse)
             out = _NativeVarlen.apply(q, k, v, layout["offsets"],
                                       layout["max_length"], attn.scaling)
-            x = residual + attn.o_proj(out.view(count, hidden))
-            residual = x
-            x = residual + layer.mlp(layer.post_attention_layernorm(x))
+            attention = attn.o_proj(out.view(count, hidden))
+            fused = residual_compact_norm(
+                residual, attention, layer.post_attention_layernorm, norm_layout)
+            if fused is None:
+                residual = residual + attention
+                normalized = layer.post_attention_layernorm(residual)
+            else:
+                residual, normalized = fused
+            x = residual + layer.mlp(normalized)
         x = model.norm(x)
     return BaseModelOutputWithPast(last_hidden_state=_Expand.apply(x, row_layout))

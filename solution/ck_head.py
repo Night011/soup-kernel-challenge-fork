@@ -14,11 +14,10 @@ the mask or by the shifted CE target:
   argmax for those rows — the metric/token-loss path stays ours;
 * training loss reuses those fp32 NLL values instead of constructing a second
   fp32 logits/log-softmax buffer; its gradient uses softmax math in Triton;
-* the backward recomputes the fp16 logits for the labelled rows and writes the
-  fp16 softmax gradient ``(p - onehot) / den`` in 128-row pieces, then
-  ``dH = dlogits_piece @ W16`` stays cuBLAS and is scattered back into the
-  full hidden gradient (zero at unlabelled/padded rows, exactly like the
-  reference's ignored positions).
+* while each fp32 logits piece is live, Triton writes the scaled fp16
+  softmax gradient and cuBLAS computes its hidden derivative;
+* backward scatters that derivative with the actual incoming loss scale.
+  No logits are recomputed or retained for backward.
 
 Why this is correct: the reference's cross-entropy is driven by the shifted
 labels, not by the attention mask.  A right-pad row has -100 there and a zero
@@ -29,18 +28,18 @@ union removes only values that the task, metrics or rewind consume as zero.
 
 The large GEMMs stay cuBLAS: a handwritten large-vocab Triton GEMM is much
 slower on a T4 and its compile time alone breaks the wall clock.  No full
-logits buffer is stored; the backward recomputes one 128-row piece at a time.
+logits buffer is stored; only a compact hidden derivative survives forward.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-# _CH — rows per head piece (only one fp16 logits piece is materialized).
+# _CH — rows per head piece (one fp32 logits piece is materialized).
 # _BLOCK — vocab elements per streaming step in the LSE kernel.
 _BN = 64
 _BK = 64
-_CH = 128
+_CH = 256
 _BLOCK = 4096
 
 _W16 = {"key": None, "tensor": None}

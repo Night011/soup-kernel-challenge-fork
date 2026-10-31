@@ -795,14 +795,19 @@ def test_joint_rope_broadcast_tables_and_gqa(dtype):
 
 
 @pytest.mark.parametrize("attention_dtype", [torch.float16, torch.float32])
-def test_residual_compact_norm_forward_and_gradients(attention_dtype):
-    from solution.ck_residual_norm import ResidualCompactNorm
+@pytest.mark.parametrize("packed", [False, True])
+def test_residual_compact_norm_forward_and_gradients(attention_dtype, packed):
+    from solution.ck_residual_norm import ResidualCompactNorm, residual_compact_norm
 
     torch.manual_seed(22)
     residual = torch.randn(2, 17, 1536, device="cuda", dtype=torch.float32)
+    if packed:
+        residual = residual.reshape(34, 1536)
     attention = torch.randn_like(residual, dtype=attention_dtype)
     weight = torch.randn(1536, device="cuda", dtype=torch.float32)
     rows = torch.tensor([0, 1, 5, 8, 17, 28, 33], device="cuda")
+    if packed:
+        rows = torch.arange(34, device="cuda")
     inverse = torch.full((34,), -1, device="cuda", dtype=torch.int32)
     inverse[rows] = torch.arange(rows.numel(), device="cuda", dtype=torch.int32)
     gf = torch.randn_like(residual)
@@ -813,7 +818,15 @@ def test_residual_compact_norm_forward_and_gradients(attention_dtype):
     norm_ref = (weight * (selected * torch.rsqrt(selected.square().mean(-1, keepdim=True) + 1e-6))).half()
     (full_ref * gf).sum().add((norm_ref * gn).float().sum()).backward()
     ro, ao = residual.clone().requires_grad_(), attention.clone().requires_grad_()
-    full, norm = ResidualCompactNorm.apply(ro, ao, weight, 1e-6, rows, inverse)
+    if packed:
+        module = torch.nn.Module()
+        module.register_buffer("weight", weight)
+        module.variance_epsilon, module._ck_output_fp16 = 1e-6, True
+        fused = residual_compact_norm(ro, ao, module, (rows, (1, 34), inverse))
+        assert fused is not None
+        full, norm = fused
+    else:
+        full, norm = ResidualCompactNorm.apply(ro, ao, weight, 1e-6, rows, inverse)
     (full * gf).sum().add((norm * gn).float().sum()).backward()
     torch.testing.assert_close(full, full_ref, rtol=0, atol=0)
     torch.testing.assert_close(norm, norm_ref, rtol=2e-3, atol=2e-3)
@@ -972,3 +985,59 @@ def test_head_real_geometry():
     assert float(hidden.grad.abs().sum().item()) > 0
     assert step is not None and step.token_loss.shape == (B, S)
     assert torch.isfinite(step.token_loss).all()
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_cpu_staged_head_upcast_keeps_parameter_values_and_requires_grad(tied):
+    from solution.ck_model_setup import _upcast_tied_head
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = torch.nn.Embedding(31, 128, device="cuda", dtype=torch.float16)
+            self.head = torch.nn.Linear(128, 31, bias=False, device="cuda", dtype=torch.float16)
+            if tied:
+                self.head.weight = self.embedding.weight
+
+        def get_input_embeddings(self):
+            return self.embedding
+
+        def get_output_embeddings(self):
+            return self.head
+
+    model = Model()
+    parameter = model.head.weight
+    expected = parameter.detach().cpu().float()
+    assert _upcast_tied_head(model) is tied
+    assert model.head.weight is parameter
+    assert model.head.weight.requires_grad
+    assert model.head.weight.is_cuda
+    assert model.head.weight.dtype == (torch.float32 if tied else torch.float16)
+    torch.testing.assert_close(model.head.weight.detach().cpu().float(), expected, rtol=0, atol=0)
+    if tied:
+        assert model.embedding.weight is model.head.weight
+    # Original PEFT freezing remains possible on the same Parameter objects.
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    assert not model.head.weight.requires_grad
+
+
+def test_cpu_staged_prepare_preserves_original_arguments_and_freezing():
+    from types import SimpleNamespace
+    from solution.ck_model_setup import _wrap_prepare
+
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.randn(9, device="cuda", dtype=torch.float16))
+    model.config = SimpleNamespace(model_type="other")
+    calls = []
+
+    def original(obj, *args, **kwargs):
+        calls.append((obj, args, kwargs))
+        for parameter in obj.parameters():
+            parameter.requires_grad_(False)
+        return obj
+
+    options = {"use_gradient_checkpointing": False, "auto_clear_cache": False}
+    assert _wrap_prepare(original)(model, "sentinel", **options) is model
+    assert calls == [(model, ("sentinel",), options)]
+    assert not model.weight.requires_grad
