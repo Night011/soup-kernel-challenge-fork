@@ -99,9 +99,10 @@ def packed_transformer(model, input_ids, attention_mask, position_ids,
             k = attn.k_proj(normalized).view(1, count, -1, dim).transpose(1, 2)
             v = attn.v_proj(normalized).view(1, count, -1, dim).transpose(1, 2)
             q, k = qm.apply_rotary_pos_emb(q, k, cos, sin)
+            kv_heads = k.shape[1]
             q, k, v = _PackQKV.apply(q, k, v, identity, packed_inverse)
             out = _NativeVarlen.apply(q, k, v, layout["offsets"],
-                                      layout["max_length"], attn.scaling)
+                                      layout["max_length"], attn.scaling, kv_heads)
             attention = attn.o_proj(out.view(count, hidden))
             fused = residual_compact_norm(
                 residual, attention, layer.post_attention_layernorm, norm_layout)

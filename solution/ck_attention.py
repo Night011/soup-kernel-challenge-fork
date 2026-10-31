@@ -107,24 +107,45 @@ class _PackQKV(torch.autograd.Function):
 
 class _NativeVarlen(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, offsets, maximum, scale):
+    def _compact_kv(tensor, kv_heads):
+        batch, count, heads, dimension = tensor.shape
+        groups = heads // kv_heads
+        return tensor.reshape(batch, count, kv_heads, groups, dimension)[:, :, :, 0, :].contiguous()
+
+    @staticmethod
+    def forward(ctx, q, k, v, offsets, maximum, scale, kv_heads=None):
+        kv_heads = k.shape[2] if kv_heads is None else int(kv_heads)
+        if kv_heads <= 0 or k.shape[2] % kv_heads:
+            raise ValueError("Packed GQA heads must divide expanded attention heads")
         with torch.autocast("cuda", enabled=False):
             result = torch.ops.aten._efficient_attention_forward(
                 q, k, v, None, offsets, offsets, maximum, maximum,
                 0.0, 1, True, scale=scale)
         out, lse, seed, offset, max_q, max_k = result
-        ctx.save_for_backward(q, k, v, offsets, out, lse, seed, offset)
+        # _PackQKV repeats each original K/V head into consecutive groups.
+        # Retain one exact copy per group, and replay dropout-free attention
+        # for its output in backward instead of retaining that output too.
+        small_k = _NativeVarlen._compact_kv(k, kv_heads)
+        small_v = _NativeVarlen._compact_kv(v, kv_heads)
+        ctx.save_for_backward(q, small_k, small_v, offsets, lse, seed, offset)
         ctx.maximums, ctx.scale = (max_q, max_k), scale
+        ctx.groups, ctx.forward_maximum = k.shape[2] // kv_heads, maximum
         return out
 
     @staticmethod
     def backward(ctx, grad):
-        q, k, v, offsets, out, lse, seed, offset = ctx.saved_tensors
+        q, small_k, small_v, offsets, lse, seed, offset = ctx.saved_tensors
+        k = small_k.repeat_interleave(ctx.groups, dim=2)
+        v = small_v.repeat_interleave(ctx.groups, dim=2)
         with torch.autocast("cuda", enabled=False):
+            out = torch.ops.aten._efficient_attention_forward(
+                q, k, v, None, offsets, offsets,
+                ctx.forward_maximum, ctx.forward_maximum,
+                0.0, 1, True, scale=ctx.scale)[0]
             dq, dk, dv, _ = torch.ops.aten._efficient_attention_backward(
                 grad.contiguous(), q, k, v, None, out, offsets, offsets,
                 *ctx.maximums, lse, 0.0, seed, offset, 1, False, scale=ctx.scale)
-        return dq, dk, dv, None, None, None
+        return (dq, dk, dv, None, None, None, None)[:len(ctx.needs_input_grad)]
 
 
 class _RestoreOutput(torch.autograd.Function):
@@ -142,8 +163,9 @@ class _RestoreOutput(torch.autograd.Function):
 
 
 def packed_attention(q, k, v, layout, scale):
+    kv_heads = k.shape[1]
     q, k, v = _PackQKV.apply(q, k, v, layout["rows"], layout["inverse"])
-    packed = _NativeVarlen.apply(q, k, v, layout["offsets"], layout["max_length"], scale)
+    packed = _NativeVarlen.apply(q, k, v, layout["offsets"], layout["max_length"], scale, kv_heads)
     return _RestoreOutput.apply(packed, layout)
 
 

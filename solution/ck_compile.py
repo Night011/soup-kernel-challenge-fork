@@ -8,6 +8,8 @@ directory, GPU visibility and external whole-command timer are unchanged.
 
 import os
 import time
+import atexit
+from threading import RLock
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -16,6 +18,8 @@ import triton
 FIXED_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 FIXED_SCALE = 2.0
 _PREPARED_MODELS = set()
+_EARLY = None
+_EARLY_LOCK = RLock()
 
 
 def prepared_for_model(name, scale):
@@ -23,7 +27,65 @@ def prepared_for_model(name, scale):
     return (str(name), float(scale)) in _PREPARED_MODELS
 
 
+def early_for_model(name, scale):
+    with _EARLY_LOCK:
+        return _EARLY is not None and _EARLY[2] == (str(name), float(scale))
+
+
+def start_early(name=FIXED_MODEL, scale=FIXED_SCALE):
+    """Begin compile-only preparation; the setup boundary must close it."""
+    global _EARLY
+    key = (str(name), float(scale))
+    with _EARLY_LOCK:
+        if prepared_for_model(*key):
+            return False
+        if _EARLY is not None:
+            return _EARLY[2] == key
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ck_early")
+        try:
+            future = pool.submit(prepare_model_name, *key)
+        except BaseException:
+            pool.shutdown(wait=True)
+            raise
+        _EARLY = (pool, future, key, time.perf_counter())
+        return True
+
+
+def close_early(name=None, scale=None):
+    """Join every preparation worker, even on failed/unsupported setup.
+
+    A result is reusable only for the requested exact model/LoRA scale.
+    Holding the lock through shutdown prevents a second preparation from
+    starting before the current workers have actually stopped.
+    """
+    global _EARLY
+    expected = None if name is None else (str(name), float(scale))
+    with _EARLY_LOCK:
+        if _EARLY is None:
+            return expected is not None and prepared_for_model(*expected)
+        pool, future, key, started = _EARLY
+        prepared = False
+        try:
+            prepared = bool(future.result())
+        except Exception as exc:
+            print(f"[ck] early compiler fallback: {type(exc).__name__}", flush=True)
+        finally:
+            try:
+                pool.shutdown(wait=True)
+            finally:
+                _EARLY = None
+        print(f"[ck] early compiler workers joined: "
+              f"{time.perf_counter() - started:.2f} s elapsed", flush=True)
+        return prepared and expected == key and prepared_for_model(*expected)
+
+
+# Some GPU unit tests call apply() without constructing a Soup model. Normal
+# training closes at setup; process exit is the cleanup fallback for those tests.
+atexit.register(close_early)
+
+
 def prepare_kernels(lm):
+    close_early()
     if getattr(lm, "_ck_kernels_prepared", False):
         return
     layers = getattr(lm.model, "layers", ())

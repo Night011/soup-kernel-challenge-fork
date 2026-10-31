@@ -50,20 +50,15 @@ from . import integrate  # noqa: E402
 def apply():
     """Ordered wiring; never raises — a failed patch prints and falls back to stock."""
     import traceback
-    import time
 
     print("[ck] apply: begin", flush=True)
-    compiler_pool = compiler_future = None
-    compiler_started = time.perf_counter()
+    ck_compile = None
     try:
         from . import ck_compile
         if (ck_compile.torch.cuda.is_available()
                 and not ck_compile.prepared_for_model(ck_compile.FIXED_MODEL, ck_compile.FIXED_SCALE)):
-            from concurrent.futures import ThreadPoolExecutor
-            compiler_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ck_apply")
-            compiler_future = compiler_pool.submit(
-                ck_compile.prepare_model_name, ck_compile.FIXED_MODEL, ck_compile.FIXED_SCALE)
-            print("[ck] compiler preparation overlaps patch imports inside apply", flush=True)
+            ck_compile.start_early()
+            print("[ck] compiler preparation overlaps patch imports and model setup", flush=True)
     except Exception as exc:
         print(f"[ck] early compiler fallback: {type(exc).__name__}", flush=True)
     try:
@@ -84,17 +79,10 @@ def apply():
                 print(f"[ck] apply: {label} FAILED (stock path stays in place)",
                       flush=True)
     finally:
-        # Compilation and launcher loading execute no kernels. Every outer
-        # and inner compiler worker is joined before apply returns, even if
-        # patch imports fail. All of this remains inside the harness timer.
-        if compiler_pool is not None:
-            try:
-                if compiler_future is not None:
-                    compiler_future.result()
-                    print(f"[ck] early compiler joined before apply returned: "
-                          f"{time.perf_counter() - compiler_started:.2f} s elapsed", flush=True)
-            except Exception as exc:
-                print(f"[ck] early compiler fallback: {type(exc).__name__}", flush=True)
-            finally:
-                compiler_pool.shutdown(wait=True)
+        # A successfully installed setup wrapper joins in its finally block.
+        # Failed patch installation cannot leave workers past this boundary.
+        if ck_compile is not None:
+            wrapper = getattr(integrate, "_COMPILER_SETUP_WRAPPED", False)
+            if not wrapper:
+                ck_compile.close_early()
     print("[ck] apply: done", flush=True)

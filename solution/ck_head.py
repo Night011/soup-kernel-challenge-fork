@@ -94,6 +94,9 @@ def offload_frozen_head(lm):
     # Transfer fp32 pieces back for our cast, never a full GPU fp32 temporary.
     weight.data = weight.detach().cpu()
     compute_weight = _w16_from_cpu(weight, device)
+    # The old CUDA master and streaming pieces are no longer used. Return
+    # those cached pages before allocating the actual training activations.
+    torch.cuda.empty_cache()
     lm._ck_head_compute_weight = compute_weight
     lm._ck_head_gpu_device = device
     _W16["key"] = _weight_key(weight)

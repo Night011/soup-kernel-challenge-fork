@@ -1041,3 +1041,16 @@ def test_cpu_staged_prepare_preserves_original_arguments_and_freezing():
     assert _wrap_prepare(original)(model, "sentinel", **options) is model
     assert calls == [(model, ("sentinel",), options)]
     assert not model.weight.requires_grad
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 12])
+def test_native_attention_compact_kv_roundtrip_is_exact(kv_heads):
+    from solution.ck_attention import _NativeVarlen
+
+    original = torch.randn(1, 17, kv_heads, 128, device="cuda", dtype=torch.float16)
+    repeated = original.repeat_interleave(12 // kv_heads, dim=2)
+    compact = _NativeVarlen._compact_kv(repeated, kv_heads)
+    assert compact.shape == original.shape
+    torch.testing.assert_close(compact, original, rtol=0, atol=0)
+    torch.testing.assert_close(compact.repeat_interleave(12 // kv_heads, dim=2),
+                               repeated, rtol=0, atol=0)

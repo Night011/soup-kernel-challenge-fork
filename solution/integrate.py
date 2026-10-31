@@ -253,6 +253,8 @@ def _ck_causal_forward(
 def engage(model):
     """Install the instance forward + hook for the challenge flow, else None."""
     global _ACTIVE
+    from .ck_compile import close_early
+    close_early()
     disengage()
     print("[ck] engage: begin", flush=True)
     if not torch.cuda.is_available():
@@ -451,43 +453,45 @@ def patch_trl_metrics_log():
 # ---------------------------------------------------------------------------
 
 def wrap_setup_transformers():
+    global _COMPILER_SETUP_WRAPPED
     import soup_cli.trainer.sft as sft_mod
 
     cls = sft_mod.SFTTrainerWrapper
     if getattr(cls._setup_transformers, "_ck_is_ours", False):
+        _COMPILER_SETUP_WRAPPED = True
         return
     orig = cls._setup_transformers
 
     def hooked(self, cfg, tcfg):
-        # Independent CPU compilation overlaps ordinary model loading, all
-        # within this setup call and the external whole-command timer.
-        if (getattr(cfg, "base", None) == "Qwen/Qwen2.5-1.5B-Instruct"
-                and str(getattr(self, "device", "")).startswith("cuda")
-                and str(getattr(tcfg, "quantization", "")) == "4bit"):
-            from concurrent.futures import ThreadPoolExecutor
-            from .ck_compile import prepare_model_name, prepared_for_model
-            lora_cfg = getattr(tcfg, "lora", None)
-            scale = float(getattr(lora_cfg, "alpha", 32)) / max(1, int(getattr(lora_cfg, "r", 16)))
-            if prepared_for_model(cfg.base, scale):
-                out = orig(self, cfg, tcfg)
-                lm = _causal_lm_of(self.model)
-                if lm is not None:
-                    lm._ck_kernels_prepared = True
-                print("[ck] model setup reuses exact model/scale preparation from apply", flush=True)
-            else:
-                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ck_setup") as pool:
-                    future = pool.submit(prepare_model_name, cfg.base, scale)
-                    out = orig(self, cfg, tcfg)
-                    try:
-                        prepared = future.result()
-                        lm = _causal_lm_of(self.model)
-                        if lm is not None:
-                            lm._ck_kernels_prepared = prepared
-                        print("[ck] compiler threads joined before model setup returned", flush=True)
-                    except Exception as exc:
-                        print(f"[ck] compiler overlap fallback: {type(exc).__name__}", flush=True)
-        else:
+        from .ck_compile import (start_early, close_early, early_for_model,
+                                 prepared_for_model)
+        expected = None
+        prepared = False
+        try:
+            if (getattr(cfg, "base", None) == "Qwen/Qwen2.5-1.5B-Instruct"
+                    and str(getattr(self, "device", "")).startswith("cuda")
+                    and str(getattr(tcfg, "quantization", "")) == "4bit"):
+                try:
+                    lora_cfg = getattr(tcfg, "lora", None)
+                    scale = float(getattr(lora_cfg, "alpha", 32)) / max(1, int(getattr(lora_cfg, "r", 16)))
+                    expected = (cfg.base, scale)
+                    if not prepared_for_model(*expected) and not early_for_model(*expected):
+                        close_early()
+                        start_early(*expected)
+                except Exception as exc:
+                    print(f"[ck] compiler overlap fallback: {type(exc).__name__}", flush=True)
+                    expected = None
             out = orig(self, cfg, tcfg)
+        finally:
+            # Always wait, including original setup exceptions and unsupported
+            # configs. Compilation cannot continue into training or escape the
+            # measured process; no GPU kernels are launched by preparation.
+            prepared = close_early(*expected) if expected is not None else close_early()
+        if expected is not None and prepared:
+            lm = _causal_lm_of(self.model)
+            if lm is not None:
+                lm._ck_kernels_prepared = True
+            print("[ck] compiler threads joined before model setup returned; exact model/scale reused", flush=True)
         try:
             engage(self.model)
         except Exception:
@@ -497,6 +501,7 @@ def wrap_setup_transformers():
 
     hooked._ck_is_ours = True
     cls._setup_transformers = hooked
+    _COMPILER_SETUP_WRAPPED = True
     print("[ck] patch setup_transformers ok", flush=True)
 
 

@@ -29,6 +29,9 @@ def _upcast_tied_head(model):
         # No local reference retains the former CUDA half storage. Upcast on
         # CPU before copying the fp32 result, so both GPU sizes never coexist.
         weight.data = host
+        # The old CUDA half storage is now unused. Release its cached pages
+        # before allocating the larger master; allocator settings stay intact.
+        torch.cuda.empty_cache()
         weight.data = host.float().to(device)
     except Exception:
         try:
