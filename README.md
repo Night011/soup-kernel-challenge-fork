@@ -29,7 +29,7 @@ The latest collator wrapper derives those indices, padding layout and token coun
 
 **Frozen head/embedding storage.** The original fp32 master remains intact on CPU; a fp16 compute copy stays on GPU. For tied embeddings this is enabled only if converting the copy back to fp32 exactly reproduces the master. An own lookup kernel emits those original fp32 embedding values. Stock no-grad forwards and disengagement restore the master. External adapter evaluation uses vanilla transformers/PEFT without our code.
 
-**NF4 and paired MLP.** Our decoder fuses NF4 lookup, double-quant scale decoding and offset addition, using the original codebooks. Tests require bitwise equality to bitsandbytes decoding. A separate kernel decodes gate/up directly into a combined matrix: one forward projection GEMM and one input-gradient GEMM replace two of each. The versioned fp16 cache now has a fixed 512 MiB budget. Uncached pairs are decoded on demand, not retained in autograd. Packed model weights remain frozen.
+**NF4 and paired MLP.** Our decoder fuses NF4 lookup, double-quant scale decoding and offset addition, using the original codebooks. Tests require bitwise equality to bitsandbytes decoding. A separate kernel decodes gate/up directly into a combined matrix: one forward projection GEMM and one input-gradient GEMM replace two of each. The versioned fp16 cache now has a fixed 320 MiB budget, reserving complete gate/up pairs together. Uncached pairs are decoded on demand, not retained in autograd. Packed model weights remain frozen.
 
 **Saved activations.** Forward uses the original fp16 gate/up values. Only backward storage is compressed to symmetric INT8 with a fp32 scale per 1024 values. RMSNorm saves fp16 input plus its original fp32 inverse standard deviation. These are small backward approximations, not bitwise-equivalence claims. Gradient tests and the complete public loss/metric/eval checks bound their observed effect; hidden quality remains to be checked by the jury.
 
@@ -67,7 +67,7 @@ python harness/score.py runs_final/result.json
 
 Use a new output directory per comparison. During development, `--only solution --out runs_try_<commit>` is faster but cannot establish the base-dependent checks. `--profile` adds a separate profiled run whose wall time is not the solution timing. Imports, cold JIT and adapter saving count in the measured command. The solution does not change the harness allocator, GPU selection or compiler-cache settings, or install packages during measurement.
 
-The latest compiler preparation uses Triton's compile-only warmup API with up to four threads inside the measured process. All threads are joined before training. The harness still starts from its own empty cache, and the full compilation time remains in the wall-clock measurement. Warmup executes no GPU kernels and is not part of the claimed GPU kernel time; ordinary training launches supply that work.
+The latest compiler preparation uses Triton's compile-only warmup API with up to four compiler threads inside the measured process. Compilation overlaps ordinary model loading within the setup function; all threads are joined before that function returns and before training. The harness still starts from its own empty cache, and the full setup time remains in the wall-clock measurement. Warmup executes no GPU kernels and is not part of the claimed GPU kernel time; ordinary training launches supply that work.
 
 ## Limits
 

@@ -14,13 +14,26 @@ import triton
 
 
 def prepare_kernels(lm):
+    if getattr(lm, "_ck_kernels_prepared", False):
+        return
     layers = getattr(lm.model, "layers", ())
     if not layers:
         return
     gate = getattr(getattr(layers[0].mlp, "gate_proj", None), "weight", None)
     if getattr(getattr(gate, "quant_state", None), "quant_type", None) != "nf4":
         return
-    cfg = lm.config
+    q_proj = layers[0].self_attn.q_proj
+    adapter = getattr(q_proj, "active_adapters", ["default"])[0]
+    scale = float(getattr(q_proj, "scaling", {}).get(adapter, 2.0))
+    lm._ck_kernels_prepared = prepare_config(lm.config, scale)
+
+
+def prepare_model_name(name, scale):
+    from transformers import AutoConfig
+    return prepare_config(AutoConfig.from_pretrained(name), scale)
+
+
+def prepare_config(cfg, scale=2.0):
     h, width, vocab = cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size
     if h % 512 or vocab % 64:
         return
@@ -56,9 +69,6 @@ def prepare_kernels(lm):
         NESTED=True, BLOCK=1024, enable_fp_fusion=False)
     add(nf4._ck_nf4_pair_kernel, (u8, u8, u8, u8, f, f, f, f, f, f, f, f, half, h * width),
         NESTED=True, BLOCK=1024, enable_fp_fusion=False)
-    q_proj = layers[0].self_attn.q_proj
-    adapter = getattr(q_proj, "active_adapters", ["default"])[0]
-    scale = float(getattr(q_proj, "scaling", {}).get(adapter, 2.0))
     add(lora._ck_lora_add_kernel, (f, half, f, 1024 * h),
         SCALE=scale, BLOCK=1024, enable_fp_fusion=False)
     add(lora._ck_lora_grad_kernel, (f, half, 1024 * h), SCALE=scale, BLOCK=1024)
@@ -76,7 +86,7 @@ def prepare_kernels(lm):
     add(padding._ck_mlp_residual_kernel, (f, half, i32, f, 1024 * h), H=h, BLOCK=1024)
     for source in (f, half):
         add(padding._ck_gather_rows_kernel, (source, i64, half, 1024 * h), H=h, BLOCK=1024)
-    kv = getattr(cfg, "head_dim", h // cfg.num_attention_heads) * cfg.num_key_value_heads
+    kv = (getattr(cfg, "head_dim", None) or h // cfg.num_attention_heads) * cfg.num_key_value_heads
     for columns in sorted({h, kv}):
         add(padding._ck_scatter_rows_kernel, (half, i32, half, 1024 * columns),
             H=columns, BLOCK=1024)
@@ -85,7 +95,7 @@ def prepare_kernels(lm):
     add(residual._ck_residual_norm_bwd_kernel, (f, half, f, i32, half, f, f, half),
         H=h, BLOCK=block)
     hq, hk = cfg.num_attention_heads, cfg.num_key_value_heads
-    dim = getattr(cfg, "head_dim", h // hq)
+    dim = getattr(cfg, "head_dim", None) or h // hq
     for backward in (False, True):
         for sequence in (512, 511):
             qb, qh, qs = (sequence * h, sequence * dim, dim) if backward else (sequence * h, dim, h)
@@ -120,3 +130,4 @@ def prepare_kernels(lm):
           f"{workers} joined threads, {time.perf_counter() - started:.2f} s", flush=True)
     if failures:
         print(f"[ck] on-demand JIT fallback for: {failures}", flush=True)
+    return True

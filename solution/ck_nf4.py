@@ -77,26 +77,26 @@ def can_pair_weights(gate, up, states=None):
             and gate.device == up.device)
 
 
-def register_mlp_cache(lm, limit_bytes=512 * 2**20):
+def register_mlp_cache(lm, limit_bytes=320 * 2**20):
     """Bound the cache and prioritize pairs which also fuse MLP matmuls."""
     clear_weight_cache()
     reserved = 0
     layers = list(getattr(lm.model, "layers", []))
-    projections = [getattr(getattr(layer, "mlp", None), name, None)
-                   for layer in layers for name in ("gate_proj", "up_proj")]
-    projections += [getattr(getattr(layer, "mlp", None), "down_proj", None)
-                    for layer in layers]
-    projections += [getattr(getattr(layer, "self_attn", None), name, None)
-                    for layer in layers for name in ("q_proj", "k_proj", "v_proj", "o_proj")]
-    for projection in projections:
-        weight = getattr(projection, "weight", None)
-        state = getattr(weight, "quant_state", None)
-        if (state is None or weight.requires_grad or not weight.is_cuda
-                or state.dtype != torch.float16 or state.quant_type != "nf4"):
+    groups = [[getattr(getattr(layer, "mlp", None), name, None)
+               for name in ("gate_proj", "up_proj")] for layer in layers]
+    groups += [[getattr(getattr(layer, "mlp", None), "down_proj", None)] for layer in layers]
+    groups += [[getattr(getattr(layer, "self_attn", None), name, None)]
+               for layer in layers for name in ("q_proj", "k_proj", "v_proj", "o_proj")]
+    for group in groups:
+        weights = [getattr(projection, "weight", None) for projection in group]
+        states = [getattr(weight, "quant_state", None) for weight in weights]
+        if any(state is None or weight.requires_grad or not weight.is_cuda
+               or state.dtype != torch.float16 or state.quant_type != "nf4"
+               for weight, state in zip(weights, states)):
             continue
-        size = state.shape[0] * state.shape[1] * 2
+        size = sum(state.shape[0] * state.shape[1] * 2 for state in states)
         if reserved + size <= limit_bytes:
-            _CACHEABLE.add(weight.data_ptr())
+            _CACHEABLE.update(weight.data_ptr() for weight in weights)
             reserved += size
     print(f"[ck] exact frozen decode cache: {len(_CACHEABLE)} weights, "
           f"{reserved / 2**20:.1f} MiB limit", flush=True)
