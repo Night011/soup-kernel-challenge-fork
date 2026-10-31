@@ -259,6 +259,24 @@ def engage(model):
         hook = ck_head.CKHeadHook()
         hook.causal_lm = lm
         hook.orig_forward = lm.forward
+        # The frozen MLP immediately autocasts its norm output for its base
+        # projections. Emitting that fp16 boundary directly also keeps the
+        # frozen gate/up/down results in fp16 instead of round-trip upcasts.
+        # Leave input_layernorm alone: it also feeds LoRA's fp32 dropout.
+        hook.fp16_mlp_norms = []
+        for layer in getattr(lm.model, "layers", []):
+            norm = getattr(layer, "post_attention_layernorm", None)
+            mlp = getattr(layer, "mlp", None)
+            if norm is None or mlp is None:
+                continue
+            projections = [getattr(mlp, name, None)
+                           for name in ("gate_proj", "up_proj", "down_proj")]
+            if all(p is not None and hasattr(p, "quant_state")
+                   and not hasattr(proj, "lora_A")
+                   for proj in projections for p in [getattr(proj, "weight", None)]):
+                norm._ck_output_fp16 = True
+                hook.fp16_mlp_norms.append(norm)
+        print(f"[ck] fp16 frozen-MLP boundaries: {len(hook.fp16_mlp_norms)}", flush=True)
         lm._ck_orig_forward = hook.orig_forward
         lm.forward = types.MethodType(_ck_causal_forward, lm)
         _ACTIVE = hook
@@ -280,6 +298,8 @@ def disengage():
         if hook.causal_lm is not None and hook.orig_forward is not None:
             from . import ck_head
             ck_head.restore_frozen_head(hook.causal_lm)
+            for norm in getattr(hook, "fp16_mlp_norms", []):
+                norm._ck_output_fp16 = False
             hook.causal_lm.forward = hook.orig_forward
     except Exception:
         pass
