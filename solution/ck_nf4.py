@@ -43,25 +43,27 @@ def paired_mlp_weights(gate_weight, up_weight):
     return combined
 
 
-def register_mlp_cache(lm, limit_bytes=2688 * 2**20):
-    """Bound exact frozen projection caches to 2.625 GiB of GPU RAM."""
+def register_mlp_cache(lm, limit_bytes=1216 * 2**20):
+    """Bound the cache and prioritize pairs which also fuse MLP matmuls."""
     clear_weight_cache()
     reserved = 0
-    for layer in getattr(lm.model, "layers", []):
-        projections = [getattr(getattr(layer, "mlp", None), name, None)
-                       for name in ("gate_proj", "up_proj", "down_proj")]
-        projections += [getattr(getattr(layer, "self_attn", None), name, None)
-                        for name in ("q_proj", "k_proj", "v_proj", "o_proj")]
-        for projection in projections:
-            weight = getattr(projection, "weight", None)
-            state = getattr(weight, "quant_state", None)
-            if (state is None or weight.requires_grad or not weight.is_cuda
-                    or state.dtype != torch.float16 or state.quant_type != "nf4"):
-                continue
-            size = state.shape[0] * state.shape[1] * 2
-            if reserved + size <= limit_bytes:
-                _CACHEABLE.add(weight.data_ptr())
-                reserved += size
+    layers = list(getattr(lm.model, "layers", []))
+    projections = [getattr(getattr(layer, "mlp", None), name, None)
+                   for layer in layers for name in ("gate_proj", "up_proj")]
+    projections += [getattr(getattr(layer, "mlp", None), "down_proj", None)
+                    for layer in layers]
+    projections += [getattr(getattr(layer, "self_attn", None), name, None)
+                    for layer in layers for name in ("q_proj", "k_proj", "v_proj", "o_proj")]
+    for projection in projections:
+        weight = getattr(projection, "weight", None)
+        state = getattr(weight, "quant_state", None)
+        if (state is None or weight.requires_grad or not weight.is_cuda
+                or state.dtype != torch.float16 or state.quant_type != "nf4"):
+            continue
+        size = state.shape[0] * state.shape[1] * 2
+        if reserved + size <= limit_bytes:
+            _CACHEABLE.add(weight.data_ptr())
+            reserved += size
     print(f"[ck] exact frozen decode cache: {len(_CACHEABLE)} weights, "
           f"{reserved / 2**20:.1f} MiB limit", flush=True)
 
