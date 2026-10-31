@@ -10,6 +10,44 @@ import triton
 import triton.language as tl
 
 _ORIGINAL_DEQUANT = None
+_ORIGINAL_MATMUL_FORWARD = None
+_CACHEABLE = set()
+_DECODED = {}
+
+
+def clear_weight_cache():
+    _CACHEABLE.clear()
+    _DECODED.clear()
+
+
+def register_mlp_cache(lm, limit_bytes=1536 * 2**20):
+    """Keep exact decoded gate/up weights, bounded to 1.5 GiB of GPU RAM."""
+    clear_weight_cache()
+    reserved = 0
+    for layer in getattr(lm.model, "layers", []):
+        mlp = getattr(layer, "mlp", None)
+        for name in ("gate_proj", "up_proj"):
+            projection = getattr(mlp, name, None)
+            weight = getattr(projection, "weight", None)
+            state = getattr(weight, "quant_state", None)
+            if (state is None or weight.requires_grad or not weight.is_cuda
+                    or state.dtype != torch.float16 or state.quant_type != "nf4"):
+                continue
+            size = state.shape[0] * state.shape[1] * 2
+            if reserved + size <= limit_bytes:
+                _CACHEABLE.add(weight.data_ptr())
+                reserved += size
+    print(f"[ck] exact gate/up decode cache: {len(_CACHEABLE)} weights, "
+          f"{reserved / 2**20:.1f} MiB limit", flush=True)
+
+
+def _cache_key(packed, state):
+    # The task freezes these weights. Versions still invalidate a cache if a
+    # caller explicitly updates either the packed values or their scales.
+    tensors = [packed, state.absmax, state.code]
+    if state.nested:
+        tensors += [state.state2.absmax, state.state2.code, state.offset]
+    return tuple((t.data_ptr(), t._version) for t in tensors)
 
 
 @triton.jit
@@ -40,6 +78,12 @@ def decode_nf4(packed, state, out=None):
             or not isinstance(state.code, torch.Tensor)
             or not state.code.is_cuda or state.code.numel() != 16):
         return None
+    key = None
+    if out is None and packed.data_ptr() in _CACHEABLE:
+        key = _cache_key(packed, state)
+        cached = _DECODED.get(packed.data_ptr())
+        if cached is not None and cached[0] == key:
+            return cached[1].t() if packed.shape[0] == 1 else cached[1]
     if state.nested:
         s2 = state.state2
         if (s2 is None or s2.nested or s2.blocksize != 256
@@ -59,11 +103,14 @@ def decode_nf4(packed, state, out=None):
         packed, state.absmax, state.code, code8, scale2, offset, out, out.numel(),
         NESTED=state.nested, BLOCK=1024, num_warps=4, enable_fp_fusion=False,
     )
+    if key is not None:
+        _DECODED[packed.data_ptr()] = (key, out)
     return out.t() if packed.shape[0] == 1 else out
 
 
 def patch_nf4_decode():
     import bitsandbytes.functional as functional
+    patch_nf4_matmul()
     global _ORIGINAL_DEQUANT
     if getattr(functional.dequantize_4bit, "_ck_is_ours", False):
         return
@@ -80,3 +127,39 @@ def patch_nf4_decode():
 
     dequantize._ck_is_ours = True
     functional.dequantize_4bit = dequantize
+
+
+def patch_nf4_matmul():
+    """Use our fused decode for the frozen fp16 forward as well as backward."""
+    from bitsandbytes.autograd._functions import MatMul4Bit
+    import torch.nn.functional as functional
+    global _ORIGINAL_MATMUL_FORWARD
+
+    original = MatMul4Bit.forward
+    if getattr(original, "_ck_is_ours", False):
+        return
+    _ORIGINAL_MATMUL_FORWARD = original
+
+    def forward(ctx, A, B, out=None, bias=None, quant_state=None):
+        if (not A.is_cuda or A.dtype != torch.float16 or A.numel() == 0 or B.numel() <= 1
+                or not B.is_contiguous() or quant_state is None
+                or (bias is not None and (bias.requires_grad or bias.dtype != A.dtype))):
+            return original(ctx, A, B, out, bias, quant_state)
+        packed = B.view(-1, 1)
+        decoded = decode_nf4(packed, quant_state)
+        if decoded is None:
+            return original(ctx, A, B, out, bias, quant_state)
+        output = functional.linear(A, decoded, bias)
+        if out is not None:
+            out.copy_(output)
+            output = out
+        # Preserve the state expected by bitsandbytes' unchanged backward.
+        ctx.is_empty = False
+        ctx.state = quant_state
+        ctx.dtype_A, ctx.dtype_B = A.dtype, B.dtype
+        ctx.dtype_bias = None if bias is None else bias.dtype
+        ctx.tensors = (None, packed) if any(ctx.needs_input_grad[:2]) else (None, None)
+        return output
+
+    forward._ck_is_ours = True
+    MatMul4Bit.forward = staticmethod(forward)
