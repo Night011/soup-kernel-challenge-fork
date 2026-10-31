@@ -10,6 +10,25 @@ torch = pytest.importorskip("torch")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("shape", [(65, 128), (1536, 1536)])
+def test_nf4_decode_matches_bitsandbytes(nested, shape):
+    import bitsandbytes.functional as functional
+    from solution import ck_nf4
+
+    torch.manual_seed(9)
+    weight = torch.randn(*shape, device="cuda", dtype=torch.float16)
+    packed, state = functional.quantize_4bit(weight, blocksize=64,
+                                            compress_statistics=nested, quant_type="nf4")
+    reference_fn = ck_nf4._ORIGINAL_DEQUANT or functional.dequantize_4bit
+    reference = reference_fn(packed, state)
+    out = ck_nf4.decode_nf4(packed, state)
+    assert out is not None
+    torch.testing.assert_close(out, reference, rtol=0, atol=0)
+    transposed = ck_nf4.decode_nf4(packed.t(), state)
+    torch.testing.assert_close(transposed, reference.t(), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("base_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("scale", [2.0, 1.7])
 def test_lora_add_matches_pytorch(base_dtype, scale):
