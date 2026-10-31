@@ -608,6 +608,35 @@ def test_compact_mlp_residual_matches_scatter_add():
     torch.testing.assert_close(po.grad, pr.grad, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_joint_rope_broadcast_tables_and_gqa(dtype):
+    from solution.ck_rope import ck_rope
+    from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+
+    torch.manual_seed(21)
+    q = torch.randn(2, 33, 6, 64, device="cuda", dtype=dtype).transpose(1, 2)
+    k = torch.randn(2, 33, 2, 64, device="cuda", dtype=dtype).transpose(1, 2)
+    angles = torch.randn(1, 33, 32, device="cuda")
+    angles = torch.cat((angles, angles), dim=-1)
+    cosine = angles.cos().expand(2, -1, -1)
+    sine = angles.sin().expand(2, -1, -1).contiguous()
+    # Use the reference formula directly: solution.apply may already patch
+    # transformers' symbol in an earlier test in this process.
+    def reference_rotate(x):
+        rotated = torch.cat((-x[..., 32:], x[..., :32]), dim=-1)
+        return x * cosine[:, None] + rotated * sine[:, None]
+    qr, kr = q.clone().requires_grad_(), k.clone().requires_grad_()
+    rq, rk = reference_rotate(qr), reference_rotate(kr)
+    dq, dk = torch.randn_like(q), torch.randn_like(k)
+    ((rq * dq).sum() + (rk * dk).sum()).backward()
+    qo, ko = q.clone().requires_grad_(), k.clone().requires_grad_()
+    oq, ok = ck_rope(qo, ko, cosine, sine)
+    ((oq * dq).float().sum() + (ok * dk).float().sum()).backward()
+    tolerance = 2e-2 if dtype == torch.float16 else 2e-5
+    for actual, expected in ((oq, rq), (ok, rk), (qo.grad, qr.grad), (ko.grad, kr.grad)):
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=tolerance, atol=tolerance)
+
+
 def test_smoke_full_qwen2_flow():
     """End-to-end: tiny Qwen2 in the Soup-T4 layout (fp32 body from
     `prepare_model_for_kbit_training`, fp16 autocast compute, fp32 frozen
