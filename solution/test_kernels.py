@@ -485,9 +485,10 @@ def test_mlp_padding_layout_guards_and_restores():
 
 
 @pytest.mark.parametrize("left_padding", [False, True])
-def test_mlp_padding_full_transformer_gradients(left_padding):
+@pytest.mark.parametrize("fused_residual", [False, True])
+def test_mlp_padding_full_transformer_gradients(left_padding, fused_residual):
     import solution
-    from solution.ck_padding import compact_mlp_rows
+    from solution.ck_padding import compact_mlp_rows, install_fused_residual
     from transformers import Qwen2Config, Qwen2Model
 
     solution.apply()
@@ -518,6 +519,8 @@ def test_mlp_padding_full_transformer_gradients(left_padding):
                           use_cache=False).last_hidden_state
     reference.backward(gradient)
     compact_input = hidden.clone().requires_grad_()
+    if fused_residual:
+        assert all(install_fused_residual(layer) for layer in model.layers)
     with compact_mlp_rows(am, labels), torch.autocast("cuda", dtype=torch.float16):
         actual = model(inputs_embeds=compact_input, attention_mask=am,
                        use_cache=False).last_hidden_state
@@ -527,6 +530,27 @@ def test_mlp_padding_full_transformer_gradients(left_padding):
     difference = torch.linalg.vector_norm(compact_input.grad - reference_input.grad)
     norm = torch.linalg.vector_norm(reference_input.grad)
     assert float(difference / norm) < 0.015
+
+
+def test_compact_mlp_residual_matches_scatter_add():
+    from solution.ck_padding import CompactMLPResidual
+
+    residual = torch.randn(2, 17, 256, device="cuda", dtype=torch.float32)
+    rows = torch.tensor([0, 2, 7, 8, 9, 15, 18, 22, 33], device="cuda")
+    inverse = torch.full((34,), -1, device="cuda", dtype=torch.int32)
+    inverse[rows] = torch.arange(rows.numel(), device="cuda", dtype=torch.int32)
+    packed = torch.randn(rows.numel(), 256, device="cuda", dtype=torch.float16)
+    gradient = torch.randn_like(residual)
+    rr, pr = residual.clone().requires_grad_(), packed.clone().requires_grad_()
+    scattered = pr.new_zeros(34, 256).index_copy_(0, rows, pr).view_as(rr)
+    reference = rr + scattered
+    reference.backward(gradient)
+    ro, po = residual.clone().requires_grad_(), packed.clone().requires_grad_()
+    actual = CompactMLPResidual.apply(ro, po, rows, inverse)
+    actual.backward(gradient)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    torch.testing.assert_close(ro.grad, rr.grad, rtol=0, atol=0)
+    torch.testing.assert_close(po.grad, pr.grad, rtol=0, atol=0)
 
 
 def test_smoke_full_qwen2_flow():
