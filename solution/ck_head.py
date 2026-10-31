@@ -61,15 +61,16 @@ def _ck_lse_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, V,
                    BLOCK: tl.constexpr):
     """Per-row logsumexp + argmax + NLL + entropy.
 
-    Three streaming passes over one row keep the kernel simple and numerically
-    identical to the reference fp32 logsumexp: max/argmax, sum(exp), and the
-    entropy reduction.  Only rows kept by the mask/target union reach it; the
-    caller applies the attention-mask weight when averaging the entropy.
+    Two streaming passes over one row compute a numerically stable online
+    logsumexp/argmax followed by entropy. Only rows kept by the mask/target
+    union reach it; the caller applies the attention-mask weight when averaging
+    entropy.
     """
     r = tl.program_id(0)
     row = LOGITS + r * V
 
     mx = float("-inf")
+    sm = 0.0
     amax = 0
     for v0 in range(0, V, BLOCK):
         offs = v0 + tl.arange(0, BLOCK)
@@ -77,16 +78,10 @@ def _ck_lse_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, V,
         x = tl.load(row + offs, mask=mask, other=float("-inf")).to(tl.float32)
         bmax = tl.max(x, axis=0)
         bidx = tl.argmax(x, axis=0)
-        upd = bmax > mx
-        mx = tl.where(upd, bmax, mx)
-        amax = tl.where(upd, v0 + bidx, amax)
-
-    sm = 0.0
-    for v0 in range(0, V, BLOCK):
-        offs = v0 + tl.arange(0, BLOCK)
-        mask = offs < V
-        x = tl.load(row + offs, mask=mask, other=float("-inf")).to(tl.float32)
-        sm += tl.sum(tl.exp(x - mx), axis=0)
+        new_mx = tl.maximum(mx, bmax)
+        sm = sm * tl.exp(mx - new_mx) + tl.sum(tl.exp(x - new_mx), axis=0)
+        amax = tl.where(bmax > mx, v0 + bidx, amax)
+        mx = new_mx
 
     lse = mx + tl.log(sm)
     tgt = tl.load(TGT + r)
