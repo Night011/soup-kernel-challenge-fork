@@ -267,6 +267,13 @@ def test_smoke_full_qwen2_flow():
                          use_cache=False)
         out2.loss.backward()
         assert float(out2.loss.detach().item()) == float(out2.loss.detach().item())
+        if not cfg.tie_word_embeddings:
+            assert model.lm_head.weight.device.type == "cpu"
+        # The fp32 master must be restored for a stock no-grad inference.
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+            inferred = model(input_ids=ids, attention_mask=am, use_cache=False)
+        assert inferred.logits.is_cuda
+        assert model.lm_head.weight.is_cuda
     finally:
         integrate.disengage()
 
