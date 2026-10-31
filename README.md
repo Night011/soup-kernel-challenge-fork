@@ -67,6 +67,8 @@ python harness/score.py runs_final/result.json
 
 Use a new output directory per comparison. During development, `--only solution --out runs_try_<commit>` is faster but cannot establish the base-dependent checks. `--profile` adds a separate profiled run whose wall time is not the solution timing. Imports, cold JIT and adapter saving count in the measured command. The solution does not change the harness allocator, GPU selection or compiler-cache settings, or install packages during measurement.
 
+The latest compiler preparation uses Triton's compile-only warmup API with up to four threads inside the measured process. All threads are joined before training. The harness still starts from its own empty cache, and the full compilation time remains in the wall-clock measurement. Warmup executes no GPU kernels and is not part of the claimed GPU kernel time; ordinary training launches supply that work.
+
 ## Limits
 
 Optimized paths target frozen NF4 Qwen2 under fp16 autocast on T4. Unsupported layouts/models/PEFT modes use guarded fallbacks. No built-in Soup optimization switch is changed. CPU masters require host RAM and an initial transfer, whose time counts. The fixed cache budget trades memory for repeated decoding. INT8 saved activations and fp16 saved norm inputs are approximate; public results do not guarantee hidden-seed quality or a specific hidden-run time.
