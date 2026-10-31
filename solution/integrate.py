@@ -257,6 +257,8 @@ def engage(model):
             print("[ck] engage: skip (V%128 or K%64)", flush=True)
             return None
         hook = ck_head.CKHeadHook()
+        from . import ck_nf4
+        ck_nf4.register_mlp_cache(lm)
         hook.causal_lm = lm
         hook.orig_forward = lm.forward
         # The frozen MLP immediately autocasts its norm output for its base
@@ -290,6 +292,8 @@ def engage(model):
 
 def disengage():
     global _ACTIVE
+    from . import ck_nf4
+    ck_nf4.clear_weight_cache()
     hook = _ACTIVE
     _ACTIVE = None
     if hook is None:

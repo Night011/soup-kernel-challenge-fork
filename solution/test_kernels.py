@@ -29,6 +29,60 @@ def test_nf4_decode_matches_bitsandbytes(nested, shape):
     torch.testing.assert_close(transposed, reference.t(), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_nf4_matmul_matches_bitsandbytes(with_bias):
+    import bitsandbytes.functional as functional
+    from bitsandbytes.autograd._functions import MatMul4Bit
+    from solution import ck_nf4
+
+    torch.manual_seed(11)
+    original_forward = ck_nf4._ORIGINAL_MATMUL_FORWARD or MatMul4Bit.forward
+    ck_nf4.patch_nf4_decode()
+
+    class ReferenceFn(torch.autograd.Function):
+        forward = staticmethod(original_forward)
+        backward = staticmethod(MatMul4Bit.backward)
+
+    weight = torch.randn(128, 256, device="cuda", dtype=torch.float16)
+    packed, state = functional.quantize_4bit(weight, blocksize=64,
+                                            compress_statistics=True, quant_type="nf4")
+    x = torch.randn(2, 17, 256, device="cuda", dtype=torch.float16)
+    bias = torch.randn(128, device="cuda", dtype=torch.float16) if with_bias else None
+    dy = torch.randn(2, 17, 128, device="cuda", dtype=torch.float16)
+    xr = x.clone().requires_grad_()
+    xo = x.clone().requires_grad_()
+    ref = ReferenceFn.apply(xr, packed, None, bias, state)
+    out = MatMul4Bit.apply(xo, packed, None, bias, state)
+    ref.backward(dy)
+    out.backward(dy)
+    torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-2)
+    torch.testing.assert_close(xo.grad, xr.grad, rtol=2e-3, atol=2e-2)
+
+
+def test_nf4_cache_invalidation():
+    import bitsandbytes.functional as functional
+    from solution import ck_nf4
+
+    torch.manual_seed(12)
+    weight = torch.randn(128, 256, device="cuda", dtype=torch.float16)
+    packed, state = functional.quantize_4bit(weight, blocksize=64,
+                                            compress_statistics=True, quant_type="nf4")
+    original = ck_nf4._ORIGINAL_DEQUANT or functional.dequantize_4bit
+    ck_nf4.clear_weight_cache()
+    ck_nf4._CACHEABLE.add(packed.data_ptr())
+    try:
+        first = ck_nf4.decode_nf4(packed, state)
+        second = ck_nf4.decode_nf4(packed, state)
+        assert first.data_ptr() == second.data_ptr()
+        torch.testing.assert_close(first, original(packed, state), rtol=0, atol=0)
+        packed.bitwise_xor_(1)
+        changed = ck_nf4.decode_nf4(packed, state)
+        torch.testing.assert_close(changed, original(packed, state), rtol=0, atol=0)
+        assert changed.data_ptr() != first.data_ptr()
+    finally:
+        ck_nf4.clear_weight_cache()
+
+
 @pytest.mark.parametrize("base_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("scale", [2.0, 1.7])
 def test_lora_add_matches_pytorch(base_dtype, scale):
