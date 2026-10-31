@@ -182,7 +182,12 @@ def _ck_causal_forward(
         )
     ck_head.offload_frozen_head(self)
     from .ck_padding import compact_mlp_rows
-    with compact_mlp_rows(attention_mask, labels):
+    # Replay-based checkpointing would outlive this forward-only batch context.
+    # Preserve its stock execution rather than changing the configured flag.
+    compact_mask = attention_mask
+    if past_key_values is not None or getattr(self.model, "gradient_checkpointing", False):
+        compact_mask = None
+    with compact_mlp_rows(compact_mask, labels):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
