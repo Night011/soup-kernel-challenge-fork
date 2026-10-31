@@ -169,9 +169,14 @@ def _compact_decoder_forward(self, hidden_states, attention_mask=None,
         hidden_states=hidden_states, attention_mask=attention_mask,
         position_ids=position_ids, past_key_values=past_key_values,
         use_cache=use_cache, position_embeddings=position_embeddings, **kwargs)
-    hidden_states = residual + hidden_states
-    residual = hidden_states
-    hidden_states = self.post_attention_layernorm(hidden_states)
+    from .ck_residual_norm import residual_compact_norm
+    fused = residual_compact_norm(residual, hidden_states, self.post_attention_layernorm, layout)
+    if fused is None:
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+    else:
+        residual, hidden_states = fused
     hidden_states = self.mlp(hidden_states)
     return CompactMLPResidual.apply(residual, hidden_states, layout[0], layout[2])
 

@@ -541,15 +541,16 @@ def test_mlp_padding_layout_guards_and_restores():
 
 @pytest.mark.parametrize("left_padding", [False, True])
 @pytest.mark.parametrize("fused_residual", [False, True])
-def test_mlp_padding_full_transformer_gradients(left_padding, fused_residual):
+@pytest.mark.parametrize("hidden_size", [256, 512])
+def test_mlp_padding_full_transformer_gradients(left_padding, fused_residual, hidden_size):
     import solution
     from solution.ck_padding import compact_mlp_rows, install_fused_residual
     from transformers import Qwen2Config, Qwen2Model
 
     solution.apply()
     torch.manual_seed(18)
-    cfg = Qwen2Config(vocab_size=128, hidden_size=256, intermediate_size=512,
-                      num_hidden_layers=2, num_attention_heads=2,
+    cfg = Qwen2Config(vocab_size=128, hidden_size=hidden_size, intermediate_size=512,
+                      num_hidden_layers=2, num_attention_heads=hidden_size // 128,
                       num_key_value_heads=1, max_position_embeddings=64,
                       attention_dropout=0.0)
     model = Qwen2Model(cfg).cuda().train()
@@ -566,7 +567,7 @@ def test_mlp_padding_full_transformer_gradients(left_padding, fused_residual):
     labels = torch.full_like(am, -100)
     labels[am.bool()] = 1
     labels[:, start] = -100
-    hidden = torch.randn(2, 32, 256, device="cuda")
+    hidden = torch.randn(2, 32, hidden_size, device="cuda")
     gradient = torch.randn_like(hidden) * am[:, :, None]
     reference_input = hidden.clone().requires_grad_()
     with torch.autocast("cuda", dtype=torch.float16):
@@ -635,6 +636,33 @@ def test_joint_rope_broadcast_tables_and_gqa(dtype):
     tolerance = 2e-2 if dtype == torch.float16 else 2e-5
     for actual, expected in ((oq, rq), (ok, rk), (qo.grad, qr.grad), (ko.grad, kr.grad)):
         torch.testing.assert_close(actual.float(), expected.float(), rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize("attention_dtype", [torch.float16, torch.float32])
+def test_residual_compact_norm_forward_and_gradients(attention_dtype):
+    from solution.ck_residual_norm import ResidualCompactNorm
+
+    torch.manual_seed(22)
+    residual = torch.randn(2, 17, 1536, device="cuda", dtype=torch.float32)
+    attention = torch.randn_like(residual, dtype=attention_dtype)
+    weight = torch.randn(1536, device="cuda", dtype=torch.float32)
+    rows = torch.tensor([0, 1, 5, 8, 17, 28, 33], device="cuda")
+    inverse = torch.full((34,), -1, device="cuda", dtype=torch.int32)
+    inverse[rows] = torch.arange(rows.numel(), device="cuda", dtype=torch.int32)
+    gf = torch.randn_like(residual)
+    gn = torch.randn(rows.numel(), 1536, device="cuda", dtype=torch.float16)
+    rr, ar = residual.clone().requires_grad_(), attention.clone().requires_grad_()
+    full_ref = rr + ar
+    selected = full_ref.reshape(-1, 1536).index_select(0, rows)
+    norm_ref = (weight * (selected * torch.rsqrt(selected.square().mean(-1, keepdim=True) + 1e-6))).half()
+    (full_ref * gf).sum().add((norm_ref * gn).float().sum()).backward()
+    ro, ao = residual.clone().requires_grad_(), attention.clone().requires_grad_()
+    full, norm = ResidualCompactNorm.apply(ro, ao, weight, 1e-6, rows, inverse)
+    (full * gf).sum().add((norm * gn).float().sum()).backward()
+    torch.testing.assert_close(full, full_ref, rtol=0, atol=0)
+    torch.testing.assert_close(norm, norm_ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(ro.grad, rr.grad, rtol=3e-3, atol=3e-3)
+    torch.testing.assert_close(ao.grad, ar.grad, rtol=3e-3, atol=3e-3)
 
 
 def test_smoke_full_qwen2_flow():
