@@ -8,6 +8,7 @@ the product is rounded to update.dtype before the addition, as in PyTorch.
 import torch
 import triton
 import triton.language as tl
+from .ck_dropout import compact_lora_dropout
 
 
 @triton.jit
@@ -77,7 +78,7 @@ def patch_lora_add():
         self._check_forward_args(x)
         base = self.base_layer(x)
         update = self.lora_B[adapter](
-            self.lora_A[adapter](self.lora_dropout[adapter](x))
+            self.lora_A[adapter](compact_lora_dropout(self.lora_dropout[adapter], x))
         )
         scale = self.scaling[adapter]
         if (base.is_contiguous() and update.is_contiguous()
