@@ -123,6 +123,6 @@ def patch_qwen2_mlp():
         act = getattr(getattr(self, "config", None), "hidden_act", "silu")
         if act != "silu" or not x.is_cuda:
             return original(self, x)
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x), compress=False))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x), compress=True))
 
     modeling_qwen2.Qwen2MLP.forward = forward
