@@ -1,9 +1,9 @@
 """Fused SwiGLU (silu(gate) * up) in Triton, forward and backward.
 
-This is our own 2-D tiled kernel, not the starter-kit 1-D example: one program
-covers a ``BM x BN`` tile of the flattened ``(rows, hidden)`` matrix, so the
-grid is smaller and the per-program work is large enough to amortise the
-sigmoid.  The math is the same fp32 formula the example/stock path uses:
+This is a 2-D tiled adaptation of the starter-kit 1-D example. Its forward and
+backward kernels are explicitly marked as examples and do not count toward
+the challenge's own-kernel time requirement. The math is the same fp32
+formula the example/stock path uses:
 
     out   = gate * sigmoid(gate) * up
     dup   = grad * gate * sigmoid(gate)
@@ -25,7 +25,7 @@ _SW_BN = 2048
 
 
 @triton.jit
-def _ck_swiglu_fwd_kernel(GATE, UP, OUT, M, N,
+def example_swiglu_fwd_kernel(GATE, UP, OUT, M, N,
                           BM: tl.constexpr, BN: tl.constexpr):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -41,7 +41,7 @@ def _ck_swiglu_fwd_kernel(GATE, UP, OUT, M, N,
 
 
 @triton.jit
-def _ck_swiglu_bwd_kernel(GRAD, GATE, UP, DGATE, DUP, M, N,
+def example_swiglu_bwd_kernel(GRAD, GATE, UP, DGATE, DUP, M, N,
                           BM: tl.constexpr, BN: tl.constexpr):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -72,7 +72,7 @@ class SwiGLU(torch.autograd.Function):
         cols = gate.shape[-1]
         out = torch.empty_like(gate)
         grid = (triton.cdiv(rows, _SW_BM), triton.cdiv(cols, _SW_BN))
-        _ck_swiglu_fwd_kernel[grid](
+        example_swiglu_fwd_kernel[grid](
             gate, up, out, rows, cols,
             BM=_SW_BM, BN=_SW_BN, num_warps=8, num_stages=2,
         )
@@ -87,7 +87,7 @@ class SwiGLU(torch.autograd.Function):
         cols = gate.shape[-1]
         dgate, dup = torch.empty_like(gate), torch.empty_like(up)
         grid = (triton.cdiv(rows, _SW_BM), triton.cdiv(cols, _SW_BN))
-        _ck_swiglu_bwd_kernel[grid](
+        example_swiglu_bwd_kernel[grid](
             grad, gate, up, dgate, dup, rows, cols,
             BM=_SW_BM, BN=_SW_BN, num_warps=8, num_stages=2,
         )

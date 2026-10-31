@@ -12,8 +12,8 @@ the mask or by the shifted CE target:
   not the attention mask alone;
 * our Triton ``_ck_lse_kernel`` produces per-row logsumexp, NLL, entropy and
   argmax for those rows — the metric/token-loss path stays ours;
-* the training loss and its gradient use the same fp32 cross-entropy math as
-  the stock head, on the labelled rows only;
+* the training loss uses stock fp32 cross-entropy; its gradient uses the same
+  softmax math in Triton on the labelled rows only;
 * the backward recomputes the fp16 logits for the labelled rows and writes the
   fp16 softmax gradient ``(p - onehot) / den`` in 128-row pieces, then
   ``dH = dlogits_piece @ W16`` stays cuBLAS and is scattered back into the
@@ -102,6 +102,36 @@ def _ck_lse_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, V,
     tl.store(AMAX + r, amax)
     tl.store(NLL + r, nll)
     tl.store(ENT + r, ent)
+
+
+@triton.jit
+def _ck_ce_lse_kernel(LOGITS, LSE, V, BLOCK: tl.constexpr):
+    """Normalise the recomputed logits used by the loss backward pass."""
+    row = tl.program_id(0)
+    mx = float("-inf")
+    sm = 0.0
+    for start in range(0, V, BLOCK):
+        col = start + tl.arange(0, BLOCK)
+        x = tl.load(LOGITS + row * V + col, mask=col < V,
+                    other=float("-inf")).to(tl.float32)
+        new_mx = tl.maximum(mx, tl.max(x, axis=0))
+        sm = sm * tl.exp(mx - new_mx) + tl.sum(tl.exp(x - new_mx), axis=0)
+        mx = new_mx
+    tl.store(LSE + row, mx + tl.log(sm))
+
+
+@triton.jit
+def _ck_ce_grad_kernel(LOGITS, LSE, TARGET, DLOGITS, V, INV_DEN,
+                       BLOCK: tl.constexpr):
+    """Write the scaled fp16 CE gradient for a tile of labelled logits."""
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < V
+    x = tl.load(LOGITS + row * V + col, mask=mask, other=0.0).to(tl.float32)
+    lse = tl.load(LSE + row)
+    target = tl.load(TARGET + row)
+    grad = (tl.exp(x - lse) - (col == target).to(tl.float32)) * INV_DEN
+    tl.store(DLOGITS + row * V + col, grad.to(tl.float16), mask=mask)
 
 
 def _w16_for(weight):
@@ -290,15 +320,17 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
             for a in range(0, n_lab_b, _CH):
                 nrows = min(_CH, n_lab_b - a)
                 logits = torch.mm(x_lab_b[a:a + nrows], wt_b)
-                lg = logits.float()
-                mx = lg.max(dim=-1, keepdim=True).values
-                p = torch.exp(lg - mx)
-                p /= p.sum(dim=-1, keepdim=True)
-                rows = torch.arange(nrows, device=x_lab_b.device)
-                p[rows, tgt_lab_b[a:a + nrows]] -= 1.0
-                p *= inv_den
-                dH_lab[a:a + nrows] = torch.mm(p.to(torch.float16), w16_b)
-                del logits, lg, p
+                lse_b = torch.empty(nrows, dtype=torch.float32, device=x_lab_b.device)
+                dlogits = torch.empty_like(logits)
+                _ck_ce_lse_kernel[(nrows,)](
+                    logits, lse_b, V_b, BLOCK=1024, num_warps=4,
+                )
+                _ck_ce_grad_kernel[(nrows, triton.cdiv(V_b, 1024))](
+                    logits, lse_b, tgt_lab_b[a:a + nrows], dlogits, V_b, inv_den,
+                    BLOCK=1024, num_warps=4,
+                )
+                dH_lab[a:a + nrows] = torch.mm(dlogits, w16_b)
+                del logits, lse_b, dlogits
             dH = torch.zeros(npos_b, K_b, dtype=torch.float16,
                              device=x_lab_b.device)
             dH.index_copy_(0, idx_lab_b, dH_lab)
