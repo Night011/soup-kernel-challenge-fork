@@ -83,6 +83,47 @@ def test_nf4_cache_invalidation():
         ck_nf4.clear_weight_cache()
 
 
+@pytest.mark.parametrize("compress", [False, True])
+def test_paired_frozen_mlp(compress):
+    import bitsandbytes as bnb
+    from solution import ck_nf4
+    from solution.ck_mlp import paired_frozen_mlp
+
+    torch.manual_seed(14)
+    mlp = torch.nn.Module()
+    for name, n_in, n_out in (("gate_proj", 256, 512), ("up_proj", 256, 512),
+                               ("down_proj", 512, 256)):
+        proj = bnb.nn.Linear4bit(n_in, n_out, bias=False, compute_dtype=torch.float16,
+                                 quant_type="nf4", compress_statistics=True)
+        proj.weight = bnb.nn.Params4bit(proj.weight.data.half(), requires_grad=False,
+                                        quant_type="nf4", compress_statistics=True)
+        setattr(mlp, name, proj.cuda())
+    original = ck_nf4._ORIGINAL_DEQUANT or bnb.functional.dequantize_4bit
+    weights = [original(getattr(mlp, n).weight, getattr(mlp, n).weight.quant_state)
+               for n in ("gate_proj", "up_proj", "down_proj")]
+    x = torch.randn(2, 9, 256, device="cuda", dtype=torch.float16)
+    dy = torch.randn_like(x)
+    xr = x.clone().requires_grad_()
+    gate = torch.nn.functional.linear(xr, weights[0])
+    up = torch.nn.functional.linear(xr, weights[1])
+    activated = (torch.nn.functional.silu(gate.float()) * up.float()).half()
+    ref = torch.nn.functional.linear(activated, weights[2])
+    ref.backward(dy)
+    ck_nf4.clear_weight_cache()
+    ck_nf4._CACHEABLE.update([mlp.gate_proj.weight.data_ptr(), mlp.up_proj.weight.data_ptr()])
+    try:
+        xo = x.clone().requires_grad_()
+        out = paired_frozen_mlp(mlp, xo, compress=compress)
+        assert out is not None
+        out.backward(dy)
+        torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
+        error = torch.linalg.vector_norm(xo.grad.float() - xr.grad.float())
+        norm = torch.linalg.vector_norm(xr.grad.float())
+        assert float(error / norm) < (0.015 if compress else 0.002)
+    finally:
+        ck_nf4.clear_weight_cache()
+
+
 @pytest.mark.parametrize("base_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("scale", [2.0, 1.7])
 def test_lora_add_matches_pytorch(base_dtype, scale):
