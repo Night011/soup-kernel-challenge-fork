@@ -268,6 +268,8 @@ def engage(model):
         # frozen gate/up/down results in fp16 instead of round-trip upcasts.
         # Leave input_layernorm alone: it also feeds LoRA's fp32 dropout.
         hook.fp16_mlp_norms = []
+        hook.fused_residual_layers = []
+        from .ck_padding import install_fused_residual
         for layer in getattr(lm.model, "layers", []):
             norm = getattr(layer, "post_attention_layernorm", None)
             mlp = getattr(layer, "mlp", None)
@@ -282,6 +284,8 @@ def engage(model):
                 norm._ck_compact_mlp = True
                 mlp._ck_compact_mlp = True
                 hook.fp16_mlp_norms.append(norm)
+                if install_fused_residual(layer):
+                    hook.fused_residual_layers.append(layer)
         hook.compact_mlps = [layer.mlp for layer in getattr(lm.model, "layers", [])
                              if getattr(layer.mlp, "_ck_compact_mlp", False)]
         print(f"[ck] fp16 frozen-MLP boundaries: {len(hook.fp16_mlp_norms)}", flush=True)
@@ -313,6 +317,9 @@ def disengage():
                 norm._ck_compact_mlp = False
             for mlp in getattr(hook, "compact_mlps", []):
                 mlp._ck_compact_mlp = False
+            from .ck_padding import remove_fused_residual
+            for layer in getattr(hook, "fused_residual_layers", []):
+                remove_fused_residual(layer)
             hook.causal_lm.forward = hook.orig_forward
     except Exception:
         pass
