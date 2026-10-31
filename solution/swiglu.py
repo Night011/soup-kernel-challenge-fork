@@ -26,7 +26,7 @@ _SW_BN = 2048
 
 
 @triton.jit
-def example_swiglu_fwd_kernel(GATE, UP, OUT, M, N,
+def example_swiglu_fwd_kernel(GATE, UP, OUT, M, N, IN_STRIDE,
                           BM: tl.constexpr, BN: tl.constexpr):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -35,14 +35,16 @@ def example_swiglu_fwd_kernel(GATE, UP, OUT, M, N,
     mask = (rows[:, None] < M) & (cols[None, :] < N)
     offs = rows[:, None] * N + cols[None, :]
 
-    gate = tl.load(GATE + offs, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(UP + offs, mask=mask, other=0.0).to(tl.float32)
+    source = rows[:, None] * IN_STRIDE + cols[None, :]
+    gate = tl.load(GATE + source, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(UP + source, mask=mask, other=0.0).to(tl.float32)
     out = gate * tl.sigmoid(gate) * up
     tl.store(OUT + offs, out.to(OUT.dtype.element_ty), mask=mask)
 
 
 @triton.jit
 def example_swiglu_bwd_kernel(GRAD, GATE, UP, SGATE, SUP, DGATE, DUP, M, N,
+                          IN_STRIDE, OUT_STRIDE,
                           BM: tl.constexpr, BN: tl.constexpr,
                           COMPRESSED: tl.constexpr, PACK: tl.constexpr):
     pid_m = tl.program_id(0)
@@ -53,8 +55,9 @@ def example_swiglu_bwd_kernel(GRAD, GATE, UP, SGATE, SUP, DGATE, DUP, M, N,
     offs = rows[:, None] * N + cols[None, :]
 
     grad = tl.load(GRAD + offs, mask=mask, other=0.0).to(tl.float32)
-    gate = tl.load(GATE + offs, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(UP + offs, mask=mask, other=0.0).to(tl.float32)
+    source = rows[:, None] * IN_STRIDE + cols[None, :]
+    gate = tl.load(GATE + source, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(UP + source, mask=mask, other=0.0).to(tl.float32)
     if COMPRESSED:
         sg = tl.load(SGATE + offs // PACK, mask=mask, other=0.0)
         su = tl.load(SUP + offs // PACK, mask=mask, other=0.0)
@@ -64,8 +67,9 @@ def example_swiglu_bwd_kernel(GRAD, GATE, UP, SGATE, SUP, DGATE, DUP, M, N,
     sig = tl.sigmoid(gate)
     dup = grad * gate * sig
     dgate = grad * up * sig * (1.0 + gate * (1.0 - sig))
-    tl.store(DGATE + offs, dgate.to(DGATE.dtype.element_ty), mask=mask)
-    tl.store(DUP + offs, dup.to(DUP.dtype.element_ty), mask=mask)
+    destination = rows[:, None] * OUT_STRIDE + cols[None, :]
+    tl.store(DGATE + destination, dgate.to(DGATE.dtype.element_ty), mask=mask)
+    tl.store(DUP + destination, dup.to(DUP.dtype.element_ty), mask=mask)
 
 
 class SwiGLU(torch.autograd.Function):
@@ -80,7 +84,7 @@ class SwiGLU(torch.autograd.Function):
         out = torch.empty_like(gate)
         grid = (triton.cdiv(rows, _SW_BM), triton.cdiv(cols, _SW_BN))
         example_swiglu_fwd_kernel[grid](
-            gate, up, out, rows, cols,
+            gate, up, out, rows, cols, cols,
             BM=_SW_BM, BN=_SW_BN, num_warps=8, num_stages=2,
         )
         ctx.compressed = bool(compress and gate.dtype == torch.float16)
@@ -101,7 +105,7 @@ class SwiGLU(torch.autograd.Function):
         dup = torch.empty_like(up, dtype=ctx.dtype)
         grid = (triton.cdiv(rows, _SW_BM), triton.cdiv(cols, _SW_BN))
         example_swiglu_bwd_kernel[grid](
-            grad, gate, up, sg, su, dgate, dup, rows, cols,
+            grad, gate, up, sg, su, dgate, dup, rows, cols, cols, cols,
             BM=_SW_BM, BN=_SW_BN, COMPRESSED=ctx.compressed, PACK=PACK_BLOCK,
             num_warps=8, num_stages=2,
         )
@@ -123,6 +127,10 @@ def patch_qwen2_mlp():
         act = getattr(getattr(self, "config", None), "hidden_act", "silu")
         if act != "silu" or not x.is_cuda:
             return original(self, x)
+        from .ck_mlp import paired_frozen_mlp
+        paired = paired_frozen_mlp(self, x)
+        if paired is not None:
+            return paired
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x), compress=True))
 
     modeling_qwen2.Qwen2MLP.forward = forward
