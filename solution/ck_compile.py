@@ -89,6 +89,10 @@ def prepare_config(cfg, scale=2.0):
             (half, i8, i8, f, f, half, half, rows, width, width, 2 * width),
             BM=swiglu._SW_BM, BN=swiglu._SW_BN, COMPRESSED=True,
             PACK=activation.PACK_BLOCK, num_warps=8, num_stages=2)
+        add(swiglu.example_swiglu_bwd_kernel,
+            (half, half, half, half, half, half, half, rows, width, 2 * width, 2 * width),
+            BM=swiglu._SW_BM, BN=swiglu._SW_BN, COMPRESSED=False,
+            PACK=activation.PACK_BLOCK, num_warps=8, num_stages=2)
     add(padding._ck_mlp_residual_kernel, (f, half, i32, f, 1024 * h), H=h, BLOCK=1024)
     for source in (f, half):
         add(padding._ck_gather_rows_kernel, (source, i64, half, 1024 * h), H=h, BLOCK=1024)

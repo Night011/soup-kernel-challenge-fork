@@ -10,7 +10,7 @@ import torch
 import triton
 
 from . import ck_nf4
-from .ck_activation import PACK_BLOCK, pack_activations
+from .ck_activation import PACK_BLOCK
 
 
 class _PairedFrozenMLP(torch.autograd.Function):
@@ -34,14 +34,18 @@ class _PairedFrozenMLP(torch.autograd.Function):
         down = ck_nf4.decode_nf4(packed_down, packed_down.quant_state)
         result = torch.mm(activation, down.t())
         del down, activation
-        if compress:
-            saved_gate, saved_up, sg, su = pack_activations(gate, up)
+        recompute = compress
+        if recompute:
+            # Frozen projections can be replayed exactly from the much
+            # narrower norm input instead of retaining both wide activations.
+            saved_gate, saved_up, sg, su = x, x, x, x
         else:
             saved_gate, saved_up, sg, su = gate, up, gate, up
         ctx.save_for_backward(saved_gate, saved_up, sg, su, packed_gate, packed_up, packed_down)
         ctx.pair_states = (packed_gate.quant_state, packed_up.quant_state)
         ctx.down_state = packed_down.quant_state
-        ctx.shape, ctx.width, ctx.compress = shape, width, compress
+        ctx.shape, ctx.width, ctx.compress = shape, width, False
+        ctx.recompute = recompute
         return result.view(shape)
 
     @staticmethod
@@ -52,6 +56,11 @@ class _PairedFrozenMLP(torch.autograd.Function):
         hidden, width = ctx.shape[-1], ctx.width
         grad = grad.contiguous().view(-1, hidden)
         rows = grad.shape[0]
+        wgu = None
+        if ctx.recompute:
+            wgu = ck_nf4.paired_mlp_weights(packed_gate, packed_up, ctx.pair_states)
+            gu = torch.mm(gate.view(rows, hidden), wgu.t())
+            gate, up = gu[:, :width], gu[:, width:]
         down = ck_nf4.decode_nf4(packed_down, ctx.down_state)
         grad_activation = torch.mm(grad, down)
         del down
@@ -63,7 +72,8 @@ class _PairedFrozenMLP(torch.autograd.Function):
             BM=_SW_BM, BN=_SW_BN, COMPRESSED=ctx.compress, PACK=PACK_BLOCK,
             num_warps=8, num_stages=2,
         )
-        wgu = ck_nf4.paired_mlp_weights(packed_gate, packed_up, ctx.pair_states)
+        if wgu is None:
+            wgu = ck_nf4.paired_mlp_weights(packed_gate, packed_up, ctx.pair_states)
         dx = torch.mm(dgu, wgu)
         return dx.view(ctx.shape), None, None, None, None
 

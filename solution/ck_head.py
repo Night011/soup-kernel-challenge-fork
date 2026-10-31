@@ -40,7 +40,7 @@ import triton.language as tl
 # _BLOCK — vocab elements per streaming step in the LSE kernel.
 _BN = 64
 _BK = 64
-_CH = 256
+_CH = 128
 _BLOCK = 4096
 
 _W16 = {"key": None, "tensor": None}
