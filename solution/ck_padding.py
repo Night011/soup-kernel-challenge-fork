@@ -14,11 +14,12 @@ import triton.language as tl
 _LAYOUT = None
 
 
-def mlp_layout(attention_mask, labels):
+def mlp_layout(attention_mask, labels, allow_cpu=False):
     if (not isinstance(attention_mask, torch.Tensor)
             or not isinstance(labels, torch.Tensor)
             or attention_mask.ndim != 2 or labels.shape != attention_mask.shape
-            or not attention_mask.is_cuda or labels.device != attention_mask.device):
+            or (not attention_mask.is_cuda and not allow_cpu)
+            or labels.device != attention_mask.device):
         return None
     active = attention_mask.bool()
     if bool(((labels[:, 1:] != -100) & ~active[:, :-1]).any().item()):
@@ -38,10 +39,14 @@ def mlp_layout(attention_mask, labels):
 
 
 @contextmanager
-def compact_mlp_rows(attention_mask, labels):
+def compact_mlp_rows(attention_mask, labels, prepared=None):
     global _LAYOUT
     previous = _LAYOUT
-    _LAYOUT = mlp_layout(attention_mask, labels)
+    if (prepared is not None and isinstance(attention_mask, torch.Tensor)
+            and tuple(attention_mask.shape) == tuple(prepared.get("shape", ()))):
+        _LAYOUT = prepared.get("mlp_layout")
+    else:
+        _LAYOUT = mlp_layout(attention_mask, labels)
     try:
         yield
     finally:

@@ -40,11 +40,11 @@ def _trim_inputs(inputs):
         return inputs
 
 
-def _trim_inputs_inner(inputs):
+def _trim_inputs_inner(inputs, allow_cpu=False):
     if not isinstance(inputs, dict) or len(inputs) == 0:
         return inputs
     am = inputs.get("attention_mask")
-    if am is None or am.dim() != 2 or not am.is_cuda:
+    if am is None or am.dim() != 2 or (not am.is_cuda and not allow_cpu):
         return inputs
     ids = inputs.get("input_ids")
     labels = inputs.get("labels")
@@ -91,6 +91,14 @@ def patch_trainer_prepare_inputs():
 
     def prepared(self, inputs):
         out = orig(self, inputs)
+        if not isinstance(out, dict):
+            return out
+        self._ck_batch_meta = out.pop("_ck_batch_meta", None)
+        if self._ck_batch_meta is not None:
+            if not getattr(self, "_ck_cpu_meta_logged", False):
+                print("[ck] CPU batch metadata enabled before device transfer", flush=True)
+                self._ck_cpu_meta_logged = True
+            return out
         try:
             return _trim_inputs(out)
         except Exception:
@@ -187,7 +195,8 @@ def _ck_causal_forward(
     compact_mask = attention_mask
     if past_key_values is not None or getattr(self.model, "gradient_checkpointing", False):
         compact_mask = None
-    with compact_mlp_rows(compact_mask, labels):
+    prepared = getattr(getattr(_ACTIVE, "trainer", None), "_ck_batch_meta", None)
+    with compact_mlp_rows(compact_mask, labels, prepared=prepared):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -369,7 +378,10 @@ def _ck_sft_compute_loss(self, model, inputs, return_outputs=False,
     except Exception:
         pass
     setattr(self, step_attr, step)
-    if "attention_mask" in inputs:
+    metadata = getattr(self, "_ck_batch_meta", None)
+    if (metadata is not None and getattr(self.accelerator, "num_processes", 1) == 1):
+        num_tokens_in_batch = metadata["num_tokens"]
+    elif "attention_mask" in inputs:
         num_tokens_in_batch = self.accelerator.gather_for_metrics(
             inputs["attention_mask"].sum()
         ).sum().item()
@@ -397,6 +409,23 @@ def patch_trl_compute_loss():
     patched._ck_is_ours = True
     trl.SFTTrainer.compute_loss = patched
     print("[ck] patch trl compute_loss ok", flush=True)
+
+
+def patch_trl_metrics_log():
+    import trl
+
+    original = getattr(trl.SFTTrainer, "log", None)
+    if original is None or getattr(original, "_ck_is_ours", False):
+        return
+
+    def log(self, *args, **kwargs):
+        hook = _ACTIVE
+        if hook is not None and hook.trainer is self:
+            hook.flush_metrics(self)
+        return original(self, *args, **kwargs)
+
+    log._ck_is_ours = True
+    trl.SFTTrainer.log = log
 
 
 # ---------------------------------------------------------------------------
@@ -429,4 +458,7 @@ def apply_all():
     """Ordered wiring; each patch is idempotent and guarded."""
     patch_trainer_prepare_inputs()
     patch_trl_compute_loss()
+    patch_trl_metrics_log()
+    from .ck_batch import patch_collator_metadata
+    patch_collator_metadata()
     wrap_setup_transformers()
