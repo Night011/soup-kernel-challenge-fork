@@ -128,9 +128,11 @@ def patch_qwen2_mlp():
         if act != "silu" or not x.is_cuda:
             return original(self, x)
         from .ck_mlp import paired_frozen_mlp
+        from .ck_padding import scatter_mlp_rows
         paired = paired_frozen_mlp(self, x)
         if paired is not None:
-            return paired
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x), compress=True))
+            return scatter_mlp_rows(self, paired)
+        out = self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x), compress=True))
+        return scatter_mlp_rows(self, out)
 
     modeling_qwen2.Qwen2MLP.forward = forward

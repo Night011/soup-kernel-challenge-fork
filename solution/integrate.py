@@ -181,17 +181,19 @@ def _ck_causal_forward(
             output_hidden_states=output_hidden_states, return_dict=return_dict,
         )
     ck_head.offload_frozen_head(self)
-    outputs = self.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        inputs_embeds=inputs_embeds,
-        use_cache=False if use_cache is None else use_cache,
-        output_attentions=output_attentions,
-        output_hidden_states=output_hidden_states,
-        return_dict=True,
-    )
+    from .ck_padding import compact_mlp_rows
+    with compact_mlp_rows(attention_mask, labels):
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=False if use_cache is None else use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
     hidden = outputs.last_hidden_state
     hook = _ACTIVE
     try:
@@ -277,7 +279,11 @@ def engage(model):
                    and not hasattr(proj, "lora_A")
                    for proj in projections for p in [getattr(proj, "weight", None)]):
                 norm._ck_output_fp16 = True
+                norm._ck_compact_mlp = True
+                mlp._ck_compact_mlp = True
                 hook.fp16_mlp_norms.append(norm)
+        hook.compact_mlps = [layer.mlp for layer in getattr(lm.model, "layers", [])
+                             if getattr(layer.mlp, "_ck_compact_mlp", False)]
         print(f"[ck] fp16 frozen-MLP boundaries: {len(hook.fp16_mlp_norms)}", flush=True)
         lm._ck_orig_forward = hook.orig_forward
         lm.forward = types.MethodType(_ck_causal_forward, lm)
@@ -304,6 +310,9 @@ def disengage():
             ck_head.restore_frozen_head(hook.causal_lm)
             for norm in getattr(hook, "fp16_mlp_norms", []):
                 norm._ck_output_fp16 = False
+                norm._ck_compact_mlp = False
+            for mlp in getattr(hook, "compact_mlps", []):
+                mlp._ck_compact_mlp = False
             hook.causal_lm.forward = hook.orig_forward
     except Exception:
         pass
