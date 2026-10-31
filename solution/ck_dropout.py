@@ -68,7 +68,7 @@ class _CompactDropout(torch.autograd.Function):
         bits, inverse = ctx.saved_tensors
         grad = grad.contiguous()
         dx = torch.empty(ctx.shape, dtype=torch.float32, device=grad.device)
-        _ck_dropout_bwd_kernel[(triton.cdiv(grad.numel(), 1024),)](
+        _ck_dropout_bwd_kernel[(triton.cdiv(dx.numel(), 1024),)](
             grad, bits, dx, dx.numel(), ctx.scale, inverse, ctx.shape[-1],
             COMPACT=ctx.compact, BLOCK=1024, num_warps=4,
         )
