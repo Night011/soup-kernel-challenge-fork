@@ -124,6 +124,31 @@ def test_paired_frozen_mlp(compress):
         ck_nf4.clear_weight_cache()
 
 
+@pytest.mark.parametrize("shape", [(1031,), (2, 17, 1536)])
+@pytest.mark.parametrize("probability", [0.05, 0.3])
+def test_compact_dropout_preserves_rng_and_gradient(shape, probability):
+    from solution.ck_dropout import compact_lora_dropout
+
+    x = torch.randn(*shape, device="cuda", dtype=torch.float32)
+    grad = torch.randn(*shape, device="cuda", dtype=torch.float16)
+    module = torch.nn.Dropout(probability).train()
+    xr = x.clone().requires_grad_()
+    torch.manual_seed(15)
+    with torch.autocast("cuda", dtype=torch.float16):
+        ref = module(xr).half()
+    ref.backward(grad)
+    reference_tail = torch.rand(31, device="cuda")
+    xo = x.clone().requires_grad_()
+    torch.manual_seed(15)
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = compact_lora_dropout(module, xo)
+    out.backward(grad)
+    actual_tail = torch.rand(31, device="cuda")
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    torch.testing.assert_close(xo.grad, xr.grad, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual_tail, reference_tail, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("base_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("scale", [2.0, 1.7])
 def test_lora_add_matches_pytorch(base_dtype, scale):
