@@ -10,6 +10,19 @@ torch = pytest.importorskip("torch")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
 
+def test_cached_embedding_exact_check_detects_rounding_and_nan():
+    from solution.ck_head import _cached_embedding_is_exact
+
+    cached = torch.randn(19, 512, device="cuda", dtype=torch.float16)
+    master = cached.float()
+    assert _cached_embedding_is_exact(master, cached)
+    master[2, 30] += 1e-5
+    assert not _cached_embedding_is_exact(master, cached)
+    master = cached.float()
+    master[3, 44] = float("nan")
+    assert not _cached_embedding_is_exact(master, cached)
+
+
 @pytest.mark.parametrize("out_width", [128, 512])
 def test_compact_lora_projection_preserves_rng_and_gradients(out_width):
     from solution.ck_dropout import compact_lora_dropout

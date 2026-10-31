@@ -62,6 +62,7 @@ def prepare_config(cfg, scale=2.0):
         add(rms._ck_rms_bwd_kernel, (half, output, f, f, f),
             H=h, BLOCK=block, num_stages=2)
     add(head._ck_cast_kernel, (f, half, vocab * h), BLOCK=8192, num_warps=8)
+    add(head._ck_head_exact_kernel, (f, half, i32, vocab * h), BLOCK=8192, num_warps=8)
     add(head._ck_embedding_kernel, (i64, half, f, 1024 * h, h, vocab), BLOCK=1024)
     add(head._ck_lse_kernel, (f, i32, f, i32, f, f, vocab), BLOCK=4096, num_stages=1)
     add(head._ck_ce_grad_kernel, (f, f, i32, half, vocab, f, f),

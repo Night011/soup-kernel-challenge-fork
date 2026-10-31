@@ -70,7 +70,7 @@ def offload_frozen_head(lm):
         # Only offload a shared master if the cached representation is exact:
         # the lookup must reproduce the original fp32 embedding values.
         if (embedding.weight.requires_grad or embedding.max_norm is not None
-                or not torch.equal(compute_weight.float(), weight)):
+                or not _cached_embedding_is_exact(weight, compute_weight)):
             lm._ck_head_offload_rejected = True
             return
         if not hasattr(embedding, "_ck_orig_embedding_forward"):
@@ -97,6 +97,23 @@ def offload_frozen_head(lm):
     _W16["key"] = _weight_key(weight)
     lm._ck_head_offloaded = True
     print("[ck] frozen fp32 head offloaded to CPU; fp16 compute copy on GPU", flush=True)
+
+
+@triton.jit
+def _ck_head_exact_kernel(MASTER, CACHED, DIFFERENT, N, BLOCK: tl.constexpr):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    original = tl.load(MASTER + index, index < N, other=0).to(tl.float32)
+    cached = tl.load(CACHED + index, index < N, other=0).to(tl.float32)
+    different = tl.sum(((original != cached) & (index < N)).to(tl.int32), 0)
+    tl.store(DIFFERENT + tl.program_id(0), different)
+
+
+def _cached_embedding_is_exact(master, cached):
+    blocks = triton.cdiv(master.numel(), 8192)
+    different = torch.empty(blocks, device=master.device, dtype=torch.int32)
+    _ck_head_exact_kernel[(blocks,)](master, cached, different, master.numel(),
+                                    BLOCK=8192, num_warps=8)
+    return not bool(different.any().item())
 
 
 @triton.jit
