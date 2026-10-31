@@ -134,6 +134,16 @@ def _ck_ce_grad_kernel(LOGITS, LSE, TARGET, DLOGITS, V, INV_DEN,
     tl.store(DLOGITS + row * V + col, grad.to(tl.float16), mask=mask)
 
 
+@triton.jit
+def _ck_select_logits_kernel(LOGITS, ROWS, OUT, V, BLOCK: tl.constexpr):
+    """Gather labelled logits and convert them to fp32 for stock CE."""
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    source_row = tl.load(ROWS + row)
+    values = tl.load(LOGITS + source_row * V + col, mask=col < V, other=0.0)
+    tl.store(OUT + row * V + col, values.to(tl.float32), mask=col < V)
+
+
 def _w16_for(weight):
     """Cached fp16 copy of the frozen fp32 lm_head weight (our cast kernel)."""
     key = (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
@@ -281,11 +291,17 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
                     V, BLOCK=_BLOCK, num_warps=2, num_stages=1,
                 )
                 lab_chunk = lab_keep[start:end]
-                if bool(lab_chunk.any()):
-                    logits_lab = logits[lab_chunk]
-                    tgt_chunk = tgt_keep[start:end][lab_chunk].to(torch.long)
+                lab_rows = lab_chunk.nonzero(as_tuple=False).squeeze(1)
+                n_lab_chunk = lab_rows.numel()
+                if n_lab_chunk:
+                    logits_lab = torch.empty((n_lab_chunk, V), dtype=torch.float32,
+                                             device=x.device)
+                    _ck_select_logits_kernel[(n_lab_chunk, triton.cdiv(V, 1024))](
+                        logits, lab_rows, logits_lab, V, BLOCK=1024, num_warps=4,
+                    )
+                    tgt_chunk = tgt_keep[start:end].index_select(0, lab_rows).to(torch.long)
                     loss_sum += F.cross_entropy(
-                        logits_lab.float(), tgt_chunk, reduction="sum",
+                        logits_lab, tgt_chunk, reduction="sum",
                     )
                 del logits
             loss = loss_sum / den_val

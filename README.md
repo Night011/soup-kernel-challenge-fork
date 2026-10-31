@@ -13,6 +13,7 @@ data order, steps, optimizer and Soup's outputs are untouched.
 | `_ck_cast_kernel` | `solution/ck_head.py` | fp32→fp16 cast of the frozen lm_head weight into a cached fp16 copy (values equal to the autocast-cast weight the reference matmul uses) |
 | `_ck_lse_kernel` | `solution/ck_head.py` | one program per row over the 128-row cuBLAS logits piece: max/argmax, sum(exp), entropy — produces per-row logsumexp, NLL and raw entropy without a full fp32 logits tensor |
 | `_ck_ce_lse_kernel` / `_ck_ce_grad_kernel` | `solution/ck_head.py` | computes the normalizer and scaled softmax gradient for recomputed labelled logits, without materializing fp32 logits or probabilities |
+| `_ck_select_logits_kernel` | `solution/ck_head.py` | gathers labelled rows of fp16 logits directly into the fp32 tensor consumed by stock cross-entropy |
 
 The large forward/backward logits GEMMs and `dH = dlogits_piece @ W16` stay
 cuBLAS matmuls, done piece by piece so only one 128-row piece is alive at a time.
