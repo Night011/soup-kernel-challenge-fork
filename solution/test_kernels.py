@@ -429,7 +429,8 @@ def test_rmsnorm_compact_saved_input(half_output):
 
 
 @pytest.mark.parametrize("amp_scale", [None, 65536.0])
-def test_head_loss_matches_reference(amp_scale):
+@pytest.mark.parametrize("tensor_denominator", [False, True])
+def test_head_loss_matches_reference(amp_scale, tensor_denominator):
     """K3: compact chunked head + stock fp32 CE vs full fp16 logits + CE."""
     import solution.ck_head as head
 
@@ -449,6 +450,8 @@ def test_head_loss_matches_reference(amp_scale):
     labels[:, 0] = -100
     lab = labels[:, 1:] != -100
     num_items = int(lab.sum())
+    if tensor_denominator:
+        num_items = torch.tensor(num_items, device="cuda", dtype=torch.int64)
 
     ref_w = weights.to(torch.float16)
     assert hidden.requires_grad is False
@@ -513,6 +516,54 @@ def test_prepare_inputs_trim():
                        torch.arange(0, 5, device="cuda"))
     assert torch.equal(out["labels"], labels[:, 0:5])
     assert torch.equal(out["attention_mask"], am[:, 0:5])
+
+
+@pytest.mark.parametrize("leading_target", [False, True])
+def test_cpu_batch_metadata_matches_gpu_indices(leading_target):
+    from solution.ck_batch import prepare_metadata
+    from solution.ck_padding import mlp_layout
+
+    am = torch.zeros(2, 32, dtype=torch.long)
+    am[0, 2:15], am[1, :23] = 1, 1
+    labels = torch.full_like(am, -100)
+    labels[am.bool()] = 1
+    labels[:, :5] = -100
+    if leading_target:
+        labels[0, 2] = 1
+    ids = torch.zeros_like(am)
+    out = prepare_metadata({"attention_mask": am, "labels": labels, "input_ids": ids})
+    meta = out["_ck_batch_meta"]
+    am, labels = out["attention_mask"], out["labels"]
+    targets = torch.full_like(labels, -100)
+    targets[:, :-1] = labels[:, 1:]
+    keep = ((am != 0) | (targets != -100)).flatten()
+    indices = keep.nonzero().flatten()
+    labelled = targets.flatten()[indices] != -100
+    reference = indices[torch.argsort(labelled.to(torch.uint8), descending=True, stable=True)]
+    torch.testing.assert_close(meta["head_indices"], reference, rtol=0, atol=0)
+    assert meta["num_tokens"] == int(am.sum())
+    assert meta["num_labelled"] == int((targets != -100).sum())
+    gpu_layout = mlp_layout(am.cuda(), labels.cuda())
+    if leading_target:
+        assert meta["mlp_layout"] is None and gpu_layout is None
+    else:
+        torch.testing.assert_close(meta["mlp_layout"][0], gpu_layout[0].cpu(), rtol=0, atol=0)
+
+
+def test_head_metrics_are_flushed_before_log():
+    from collections import defaultdict
+    from types import SimpleNamespace
+    from solution.ck_head import CKHeadHook
+
+    trainer = SimpleNamespace(_metrics={"train": defaultdict(list)})
+    hook = CKHeadHook()
+    hook.on_backward_done(trainer, torch.tensor(2.5, device="cuda", dtype=torch.float64),
+                          torch.tensor(0.25, device="cuda", dtype=torch.float64))
+    assert not trainer._metrics["train"]["entropy"]
+    hook.flush_metrics(trainer)
+    assert trainer._metrics["train"]["entropy"] == [2.5]
+    assert trainer._metrics["train"]["mean_token_accuracy"] == [0.25]
+    assert not hook.pending_metrics
 
 
 def test_mlp_padding_layout_guards_and_restores():
