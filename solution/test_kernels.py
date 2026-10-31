@@ -83,6 +83,38 @@ def test_nf4_cache_invalidation():
         ck_nf4.clear_weight_cache()
 
 
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_nf4_compact_projection_forward_and_backward(with_bias):
+    import bitsandbytes.functional as functional
+    from bitsandbytes.autograd._functions import MatMul4Bit
+    from solution import ck_nf4
+    from solution.ck_padding import compact_mlp_rows
+
+    ck_nf4.patch_nf4_decode()
+    torch.manual_seed(20)
+    weight = torch.randn(512, 256, device="cuda", dtype=torch.float16)
+    packed, state = functional.quantize_4bit(weight, blocksize=64,
+                                            compress_statistics=True, quant_type="nf4")
+    decoded = (ck_nf4._ORIGINAL_DEQUANT or functional.dequantize_4bit)(packed, state)
+    x = torch.randn(2, 32, 256, device="cuda", dtype=torch.float16)
+    am = torch.zeros(2, 32, device="cuda", dtype=torch.long)
+    am[0, :13], am[1, :21] = 1, 1
+    labels = torch.full_like(am, -100)
+    labels[am.bool()] = 1
+    labels[:, 0] = -100
+    dy = torch.randn(2, 32, 512, device="cuda", dtype=torch.float16) * am[:, :, None]
+    bias = torch.randn(512, device="cuda", dtype=torch.float16) if with_bias else None
+    xr = x.clone().requires_grad_()
+    reference = torch.nn.functional.linear(xr, decoded, bias)
+    reference.backward(dy)
+    xo = x.clone().requires_grad_()
+    with compact_mlp_rows(am, labels):
+        actual = MatMul4Bit.apply(xo, packed, None, bias, state)
+    actual.backward(dy)
+    torch.testing.assert_close(actual[am.bool()], reference[am.bool()], rtol=2e-3, atol=2e-2)
+    torch.testing.assert_close(xo.grad, xr.grad, rtol=2e-3, atol=2e-2)
+
+
 @pytest.mark.parametrize("compress", [False, True])
 def test_paired_frozen_mlp(compress):
     import bitsandbytes as bnb
