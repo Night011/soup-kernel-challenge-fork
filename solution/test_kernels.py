@@ -177,7 +177,8 @@ def test_rmsnorm_fp16_projection_boundary():
     torch.testing.assert_close(xo.grad, xr.grad, rtol=2e-3, atol=2e-3)
 
 
-def test_head_loss_matches_reference():
+@pytest.mark.parametrize("amp_scale", [None, 65536.0])
+def test_head_loss_matches_reference(amp_scale):
     """K3: compact chunked head + stock fp32 CE vs full fp16 logits + CE."""
     import solution.ck_head as head
 
@@ -209,16 +210,21 @@ def test_head_loss_matches_reference():
     ref_loss = nll[lab.reshape(-1)].sum() / num_items
     # A non-unit upstream gradient checks that the custom backward propagates
     # loss scaling instead of silently assuming a scale of one.
-    (ref_loss * 3.0).backward()
+    upstream = 3.0 if amp_scale is None else amp_scale
+    (ref_loss * upstream).backward()
     ref_dh = hr.grad.clone()
     ref_loss_v = float(ref_loss.detach().item())
 
     ho = hidden.clone().requires_grad_(True)
     hook = head.CKHeadHook()
+    if amp_scale is not None:
+        from types import SimpleNamespace
+        hook.trainer = SimpleNamespace(accelerator=SimpleNamespace(
+            scaler=torch.amp.GradScaler("cuda", init_scale=amp_scale)))
     loss, step = head.ck_chunked_lm_loss(
         ho, labels, weights, am, num_items, hook)
     assert loss is not None, "head path must be engageable in this test"
-    (loss * 3.0).backward()
+    (loss * upstream).backward()
 
     tol = 1e-3 if ref_loss_v < 2 else 2e-3
     assert abs(float(loss.detach().item()) - ref_loss_v) <= 3e-3 * max(1, ref_loss_v)

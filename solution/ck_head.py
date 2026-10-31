@@ -195,7 +195,7 @@ def _ck_ce_lse_kernel(LOGITS, LSE, V, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _ck_ce_grad_kernel(LOGITS, LSE, TARGET, DLOGITS, V, INV_DEN,
+def _ck_ce_grad_kernel(LOGITS, LSE, TARGET, DLOGITS, V, DEN, SCALE,
                        BLOCK: tl.constexpr):
     """Write the scaled fp16 CE gradient for a tile of labelled logits."""
     row = tl.program_id(0)
@@ -204,8 +204,19 @@ def _ck_ce_grad_kernel(LOGITS, LSE, TARGET, DLOGITS, V, INV_DEN,
     x = tl.load(LOGITS + row * V + col, mask=mask, other=0.0).to(tl.float32)
     lse = tl.load(LSE + row)
     target = tl.load(TARGET + row)
-    grad = (tl.exp(x - lse) - (col == target).to(tl.float32)) * INV_DEN
+    inv_den = tl.load(SCALE) / DEN
+    grad = (tl.exp(x - lse) - (col == target).to(tl.float32)) * inv_den
     tl.store(DLOGITS + row * V + col, grad.to(tl.float16), mask=mask)
+
+
+@triton.jit
+def _ck_scatter_grad_kernel(SRC, ROWS, GRAD_OUT, SCALE, DST, N,
+                             H: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = tl.load(ROWS + i // H, i < N, other=0)
+    value = tl.load(SRC + i, i < N, other=0).to(tl.float32)
+    factor = tl.load(GRAD_OUT).to(tl.float32) / tl.load(SCALE)
+    tl.store(DST + row * H + i % H, value * factor, i < N)
 
 
 def _w16_for(weight):
@@ -313,17 +324,21 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
         n_keep = idx_keep.numel()
         if n_keep == 0:
             return None
-        x_keep = X.index_select(0, idx_keep)
         tgt_keep = tgt.index_select(0, idx_keep)
-        am_keep = am.index_select(0, idx_keep)
         lab_keep = tgt_keep != -100
         lab_pos = lab_keep.nonzero(as_tuple=False).squeeze(1)
         n_lab = lab_pos.numel()
         if n_lab == 0:
             return None
-        x_lab = x_keep.index_select(0, lab_pos)
-        tgt_lab = tgt_keep.index_select(0, lab_pos).to(torch.long)
-        idx_lab = idx_keep.index_select(0, lab_pos)
+        # Put labelled rows first inside the head only. This keeps every
+        # gradient GEMM compact without per-chunk nonzero synchronizations.
+        order = torch.argsort(lab_keep.to(torch.uint8), descending=True, stable=True)
+        idx_keep = idx_keep.index_select(0, order)
+        x_keep = X.index_select(0, idx_keep)
+        tgt_keep = tgt.index_select(0, idx_keep)
+        am_keep = am.index_select(0, idx_keep)
+        lab_keep = tgt_keep != -100
+        idx_lab = idx_keep[:n_lab]
 
     w16 = _w16_for(weight)
     if w16 is None:
@@ -335,6 +350,20 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
     if den_val <= 0.0:
         return None
 
+    # The scalar CE upstream is known up to AMP scaling. Compute its local
+    # derivative while the forward logits are live; carry the current scaler
+    # through the GEMM to preserve small fp16 probability gradients. Backward
+    # still propagates the actual upstream gradient, including other scales.
+    scaler = getattr(getattr(hook.trainer, "accelerator", None), "scaler", None)
+    if scaler is not None and scaler.is_enabled():
+        amp_scale = getattr(scaler, "_scale", None)
+        if amp_scale is None:
+            amp_scale = torch.tensor(scaler.get_scale(), device=X.device)
+        else:
+            amp_scale = amp_scale.detach()
+    else:
+        amp_scale = torch.ones((), dtype=torch.float32, device=X.device)
+
     class _CKHeadFn(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, tgt_in, am_in, w16_in):
@@ -344,6 +373,7 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
             amax = torch.empty(n_keep, dtype=torch.int32, device=x.device)
             nll = torch.empty(n_keep, dtype=torch.float32, device=x.device)
             ent = torch.empty(n_keep, dtype=torch.float32, device=x.device)
+            dH_lab = torch.empty(n_lab, K, dtype=torch.float16, device=x.device)
             wt = w16_in.t()
             for start in range(0, n_keep, _CH):
                 end = min(start + _CH, n_keep)
@@ -354,12 +384,22 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
                     amax[start:end], nll[start:end], ent[start:end],
                     V, BLOCK=_BLOCK, num_warps=2, num_stages=1,
                 )
+                labelled = max(0, min(end, n_lab) - start)
+                if labelled:
+                    dlogits = torch.empty((labelled, V), dtype=torch.float16,
+                                          device=x.device)
+                    _ck_ce_grad_kernel[(labelled, triton.cdiv(V, 1024))](
+                        logits, lse[start:end], tgt_keep[start:end], dlogits,
+                        V, den_val, amp_scale, BLOCK=1024, num_warps=4,
+                    )
+                    dH_lab[start:start + labelled] = torch.mm(dlogits, w16_in)
+                    del dlogits
                 del logits
             loss = nll.sum() / den_val
             token_loss = torch.zeros((B, S), dtype=torch.float32,
                                      device=x.device)
             token_loss.view(-1)[idx_keep] = nll
-            ctx.save_for_backward(x_lab, tgt_lab, w16_in, idx_lab)
+            ctx.save_for_backward(dH_lab, idx_lab, amp_scale)
             ctx.K, ctx.V, ctx.den = K, V, den_val
             ctx.npos, ctx.n_lab = npos, n_lab
             ctx.ent_keep, ctx.amax_keep = ent, amax
@@ -373,34 +413,13 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
 
         @staticmethod
         def backward(ctx, grad_out):
-            x_lab_b, tgt_lab_b, w16_b, idx_lab_b = ctx.saved_tensors
-            n_lab_b, npos_b, K_b, V_b = ctx.n_lab, ctx.npos, ctx.K, ctx.V
-            dH_lab = torch.empty(n_lab_b, K_b, dtype=torch.float16,
-                                 device=x_lab_b.device)
-            # AMP/Accelerate may scale the scalar loss before calling us.  A
-            # custom autograd Function must propagate that upstream gradient;
-            # scaling inv_den keeps the fp16 dlogits far below the fp16 range
-            # even for GradScaler's 2^16, unlike scaling dH after the fact.
-            scale = float(grad_out) if grad_out is not None else 1.0
-            inv_den = scale / ctx.den
-            wt_b = w16_b.t()
-            for a in range(0, n_lab_b, _CH):
-                nrows = min(_CH, n_lab_b - a)
-                logits = torch.mm(x_lab_b[a:a + nrows], wt_b)
-                lse_b = torch.empty(nrows, dtype=torch.float32, device=x_lab_b.device)
-                dlogits = torch.empty_like(logits)
-                _ck_ce_lse_kernel[(nrows,)](
-                    logits, lse_b, V_b, BLOCK=1024, num_warps=4,
-                )
-                _ck_ce_grad_kernel[(nrows, triton.cdiv(V_b, 1024))](
-                    logits, lse_b, tgt_lab_b[a:a + nrows], dlogits, V_b, inv_den,
-                    BLOCK=1024, num_warps=4,
-                )
-                dH_lab[a:a + nrows] = torch.mm(dlogits, w16_b)
-                del logits, lse_b, dlogits
-            dH = torch.zeros(npos_b, K_b, dtype=torch.float16,
-                             device=x_lab_b.device)
-            dH.index_copy_(0, idx_lab_b, dH_lab)
+            dH_lab, idx_lab_b, forward_scale = ctx.saved_tensors
+            dH = torch.zeros(ctx.npos, ctx.K, dtype=torch.float16,
+                             device=dH_lab.device)
+            _ck_scatter_grad_kernel[(triton.cdiv(dH_lab.numel(), 1024),)](
+                dH_lab, idx_lab_b, grad_out, forward_scale, dH, dH_lab.numel(),
+                H=ctx.K, BLOCK=1024, num_warps=4,
+            )
             am_sum = float(ctx.am_keep.sum().item())
             ent_mean = float((ctx.ent_keep * ctx.am_keep).sum().item()) / am_sum \
                 if am_sum > 0 else 0.0
