@@ -33,7 +33,9 @@ The latest collator wrapper derives those indices, padding layout and token coun
 
 **Saved activations.** Forward uses the original fp16 gate/up values. Only backward storage is compressed to symmetric INT8 with a fp32 scale per 1024 values. RMSNorm saves fp16 input plus its original fp32 inverse standard deviation. These are small backward approximations, not bitwise-equivalence claims. Gradient tests and the complete public loss/metric/eval checks bound their observed effect; hidden quality remains to be checked by the jury.
 
-**Padding.** `integrate.py` trims all-padding edge columns and retains original position ids. `ck_padding.py` compacts real token rows in frozen MLPs and base NF4 projections, retaining a few pad rows to align row counts to eight. Attention and LoRA/dropout keep their full batch shapes. A shifted label requiring a padding query disables row compaction for that batch. Checkpoint replay and cached decoding retain full rows. No rows move between batches. Own gather/scatter kernels restore layouts; another fuses MLP scatter with residual addition.
+**Padding.** `integrate.py` trims all-padding edge columns and retains original position ids. `ck_padding.py` compacts real token rows in frozen MLPs and base NF4 projections, retaining a few pad rows to align row counts to eight. LoRA/dropout keep their full batch shapes. A shifted label requiring a padding query disables row compaction for that batch. Checkpoint replay and cached decoding retain full rows. No rows move between batches. Own gather/scatter kernels restore layouts; another fuses MLP scatter with residual addition.
+
+The latest attention path packs real Q/K/V rows only after the unchanged projections, dropout and original-position RoPE. It passes cumulative sequence boundaries to PyTorch's existing `aten._efficient_attention_forward/backward` (the native memory-efficient SDPA backend). It does not mix attention across samples. Own kernels combine packing, fp16 conversion and GQA expansion, and restore/reduce Q/K/V gradients. Native attention remains PyTorch work, not our claimed kernel. This path requires zero attention dropout, no past cache and a supported Qwen2 shape; other cases retain the original forward.
 
 **Other fusion.** RMSNorm has own forward/backward kernels. The latest RoPE rotates Q and K together in one launch per direction, supporting GQA and strided views. LoRA scale/add preserves PEFT's two fp16 rounding points. Native PyTorch dropout generates its original mask; our kernels pack it to bits and combine packing with the following fp16 cast. Tests compare outputs, gradients and the subsequent CUDA RNG stream.
 
@@ -50,6 +52,7 @@ The latest collator wrapper derives those indices, padding layout and token coun
 | `ck_dropout.py` | `_ck_dropout_pack_kernel`, `_ck_dropout_bwd_kernel` | Native-mask packing/cast and gradient |
 | `ck_activation.py` | `_ck_pack_activations_kernel` | Compact backward activation storage |
 | `ck_padding.py` | `_ck_mlp_residual_kernel`, `_ck_gather_rows_kernel`, `_ck_scatter_rows_kernel` | Compact row movement and residual addition |
+| `ck_attention.py` | `_ck_attention_pack_kernel`, `_ck_attention_unpack_grad_kernel` | Padding removal, GQA expansion/cast and gradient restoration |
 
 All files above are in `solution/`. `swiglu.py` derives from the starter example: its `example_*` kernels, including compressed-storage and stride adaptations, are excluded from our share. Large GEMMs and SDPA remain PyTorch/cuBLAS work. The unused `_ck_ce_lse_kernel` is not claimed either.
 
@@ -81,6 +84,7 @@ New kernels are handwritten; no third-party kernel libraries or kernel implement
 - Stable online softmax: [FlashAttention paper](https://arxiv.org/abs/2205.14135).
 - Paired gate/up projections: [NVIDIA TensorRT-LLM post-load fusion](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/transforms/post_load_fusion.html).
 - Removing padding work: [PyTorch transformer building blocks](https://docs.pytorch.org/tutorials/intermediate/transformer_building_blocks.html).
+- Native variable-length attention interface: [PyTorch ATen operator schemas](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/native_functions.yaml), `_efficient_attention_forward/backward`; no backend kernel code is copied.
 - FP16 matrix alignment: [NVIDIA matrix multiplication guide](https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html).
 - Compact dropout state: [Triton low-memory dropout](https://triton-lang.org/main/getting-started/tutorials/04-low-memory-dropout.html). Our path packs the actual native mask and preserves its RNG.
 - NF4 semantics: installed bitsandbytes `QuantState`; dtype boundaries: [PyTorch AMP](https://docs.pytorch.org/docs/stable/amp.html).

@@ -716,6 +716,45 @@ def test_residual_compact_norm_forward_and_gradients(attention_dtype):
     torch.testing.assert_close(ao.grad, ar.grad, rtol=3e-3, atol=3e-3)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("left_padding", [False, True])
+def test_packed_attention_matches_dense_sdpa_and_rng(dtype, left_padding):
+    from solution.ck_attention import attention_layout_cpu, packed_attention
+
+    torch.manual_seed(24)
+    batch, sequence, hq, hk, dimension = 2, 64, 12, 2, 128
+    mask = torch.zeros(batch, sequence, dtype=torch.long)
+    start = 3 if left_padding else 0
+    mask[0, start:start + 21] = 1
+    mask[1, start:start + 43] = 1
+    labels = torch.full_like(mask, -100)
+    labels[:, start + 8:start + 17] = 1
+    layout = attention_layout_cpu(mask, labels)
+    assert layout is not None
+    layout = {key: value.cuda() if isinstance(value, torch.Tensor) else value
+              for key, value in layout.items()}
+    tensors = [torch.randn(batch, sequence, heads, dimension, device="cuda", dtype=dtype)
+               .transpose(1, 2) for heads in (hq, hk, hk)]
+    q, k, v = [tensor.clone().requires_grad_() for tensor in tensors]
+    causal = torch.ones(sequence, sequence, device="cuda", dtype=torch.bool).tril()
+    attention_mask = causal[None, None] & mask.cuda()[:, None, None, :].bool()
+    with torch.autocast("cuda", dtype=torch.float16):
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            q, k.repeat_interleave(hq // hk, 1), v.repeat_interleave(hq // hk, 1),
+            attn_mask=attention_mask, dropout_p=0.0).transpose(1, 2).reshape(batch, sequence, -1)
+    gradient = torch.randn_like(reference) * mask.cuda()[:, :, None]
+    reference.backward(gradient)
+    qo, ko, vo = [tensor.clone().requires_grad_() for tensor in tensors]
+    state = torch.cuda.get_rng_state()
+    with torch.autocast("cuda", dtype=torch.float16):
+        actual = packed_attention(qo, ko, vo, layout, dimension ** -0.5)
+    actual.backward(gradient)
+    torch.testing.assert_close(torch.cuda.get_rng_state(), state, rtol=0, atol=0)
+    torch.testing.assert_close(actual[mask.bool()], reference[mask.bool()], rtol=2e-2, atol=2e-2)
+    for original, packed in ((q, qo), (k, ko), (v, vo)):
+        torch.testing.assert_close(packed.grad, original.grad, rtol=2e-2, atol=2e-2)
+
+
 def test_smoke_full_qwen2_flow():
     """End-to-end: tiny Qwen2 in the Soup-T4 layout (fp32 body from
     `prepare_model_for_kbit_training`, fp16 autocast compute, fp32 frozen

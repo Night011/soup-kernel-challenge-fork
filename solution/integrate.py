@@ -288,7 +288,9 @@ def engage(model):
         # Leave input_layernorm alone: it also feeds LoRA's fp32 dropout.
         hook.fp16_mlp_norms = []
         hook.fused_residual_layers = []
+        hook.compact_attention_modules = []
         from .ck_padding import install_fused_residual
+        from .ck_attention import install_attention
         for layer in getattr(lm.model, "layers", []):
             norm = getattr(layer, "post_attention_layernorm", None)
             mlp = getattr(layer, "mlp", None)
@@ -305,6 +307,8 @@ def engage(model):
                 hook.fp16_mlp_norms.append(norm)
                 if install_fused_residual(layer):
                     hook.fused_residual_layers.append(layer)
+                if install_attention(layer.self_attn):
+                    hook.compact_attention_modules.append(layer.self_attn)
         hook.compact_mlps = [layer.mlp for layer in getattr(lm.model, "layers", [])
                              if getattr(layer.mlp, "_ck_compact_mlp", False)]
         print(f"[ck] fp16 frozen-MLP boundaries: {len(hook.fp16_mlp_norms)}", flush=True)
@@ -339,6 +343,9 @@ def disengage():
             from .ck_padding import remove_fused_residual
             for layer in getattr(hook, "fused_residual_layers", []):
                 remove_fused_residual(layer)
+            from .ck_attention import remove_attention
+            for attention in getattr(hook, "compact_attention_modules", []):
+                remove_attention(attention)
             hook.causal_lm.forward = hook.orig_forward
     except Exception:
         pass

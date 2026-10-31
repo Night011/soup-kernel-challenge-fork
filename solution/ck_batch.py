@@ -28,6 +28,9 @@ def prepare_metadata(batch):
         "num_labelled": labelled_rows.numel(),
         "mlp_layout": mlp_layout(am, labels, allow_cpu=True),
     }
+    if result["_ck_batch_meta"]["mlp_layout"] is not None:
+        from .ck_attention import attention_layout_cpu
+        result["_ck_batch_meta"]["attention_layout"] = attention_layout_cpu(am, labels)
     return result
 
 

@@ -12,6 +12,7 @@ import triton
 import triton.language as tl
 
 _LAYOUT = None
+_ATTENTION_LAYOUT = None
 
 
 def mlp_layout(attention_mask, labels, allow_cpu=False):
@@ -40,17 +41,25 @@ def mlp_layout(attention_mask, labels, allow_cpu=False):
 
 @contextmanager
 def compact_mlp_rows(attention_mask, labels, prepared=None):
-    global _LAYOUT
+    global _LAYOUT, _ATTENTION_LAYOUT
     previous = _LAYOUT
+    previous_attention = _ATTENTION_LAYOUT
+    _ATTENTION_LAYOUT = None
     if (prepared is not None and isinstance(attention_mask, torch.Tensor)
             and tuple(attention_mask.shape) == tuple(prepared.get("shape", ()))):
         _LAYOUT = prepared.get("mlp_layout")
+        _ATTENTION_LAYOUT = prepared.get("attention_layout")
     else:
         _LAYOUT = mlp_layout(attention_mask, labels)
     try:
         yield
     finally:
         _LAYOUT = previous
+        _ATTENTION_LAYOUT = previous_attention
+
+
+def current_attention_layout():
+    return _ATTENTION_LAYOUT
 
 
 def gather_norm_rows(norm, hidden):

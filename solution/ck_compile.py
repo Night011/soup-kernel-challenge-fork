@@ -40,6 +40,7 @@ def prepare_config(cfg, scale=2.0):
     from . import ck_rms as rms, ck_rope as rope, ck_head as head
     from . import ck_nf4 as nf4, ck_lora as lora, ck_dropout as dropout
     from . import ck_padding as padding, ck_residual_norm as residual, ck_activation as activation
+    from . import ck_attention as attention
     from . import swiglu
 
     f, half, i32, i64, u8, i8, boolean = (torch.float32, torch.float16, torch.int32,
@@ -103,6 +104,16 @@ def prepare_config(cfg, scale=2.0):
             add(rope._ck_rope_pair_kernel,
                 (f, f, f, f, f, f, sequence, hq, hk, qb, qh, qs, kb, kh, ks, 0, dim, 0, dim),
                 RD=dim, BR=rope._ROPE_ROWS, BACKWARD=backward)
+    for sequence in (512, 511):
+        add(attention._ck_attention_pack_kernel,
+            (f, f, f, i64, half, half, half, 1024 * hq * dim, sequence,
+             sequence * hq * dim, sequence * dim, dim,
+             sequence * hk * dim, sequence * dim, dim,
+             sequence * hk * dim, dim, hk * dim),
+            HQ=hq, HK=hk, D=dim, BLOCK=1024)
+        add(attention._ck_attention_unpack_grad_kernel,
+            (half, half, half, i32, f, f, f, sequence),
+            HQ=hq, HK=hk, D=dim, BR=8)
 
     started = time.perf_counter()
     # Initialize the normal CUDA compilation target once, on the main thread.
