@@ -77,7 +77,7 @@ def can_pair_weights(gate, up, states=None):
             and gate.device == up.device)
 
 
-def register_mlp_cache(lm, limit_bytes=768 * 2**20):
+def register_mlp_cache(lm, limit_bytes=512 * 2**20):
     """Bound the cache and prioritize pairs which also fuse MLP matmuls."""
     clear_weight_cache()
     reserved = 0

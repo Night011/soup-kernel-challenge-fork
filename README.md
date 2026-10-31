@@ -1,129 +1,84 @@
-# Soup Kernel Challenge — our solution
+# Soup Kernel Challenge — Atlas Solutions
 
-Own Triton kernels for a fixed `soup train` run (Qwen2.5-1.5B, NF4 + LoRA, batch 4,
-seq 512, Kaggle T4). Everything is wired from `solution/apply()`; the task settings,
-data order, steps, optimizer and Soup's outputs are untouched.
+Own Triton kernels and autograd functions for the fixed Soup 0.77.0 task on a Kaggle T4. The harness calls `solution.apply()`. Model, NF4 parameters, data and batch order, 64 steps, LoRA r=16 on q_proj/v_proj with dropout 0.05, optimizer and scheduler keep their starter settings. Only `solution/` and this README are edited.
 
-## What we changed
+Platform repository: [BAITC-Hacks/hack-d5eb16fb-atlas-solutions](https://github.com/BAITC-Hacks/hack-d5eb16fb-atlas-solutions).
+Development [Kaggle notebook](https://www.kaggle.com/code/hoogle57/notebook00ca772363). The final public saved version and exact `COMMIT` still need to be recorded after optimization; this development link is not a completed submission.
 
-| Kernel (own `@triton.jit`) | File | Replaces |
+## Measured results
+
+The last complete two-repeat comparison is [6e16e7d](https://github.com/BAITC-Hacks/hack-d5eb16fb-atlas-solutions/commit/6e16e7d), Kaggle directory `runs_full_6e16e7d`:
+
+| Metric | Base Soup | Solution | Ratio |
+|---|---:|---:|---:|
+| Whole soup train, mean of two runs | 77.11 s | 61.52 s | 1.2534× speedup |
+| Peak GPU memory | 14348 MiB | 5040 MiB | 2.8468× base/solution |
+| Public eval loss | 2.04965 | 2.04967 | +0.001% |
+
+Solution times: 61.19 and 61.84 s. **All 10 rule checks passed**, including 79 Soup regression tests. Own-kernel shares: 13.316% and 12.975%; the lower value counts. Starter SwiGLU is excluded.
+
+Further development has changed the solution since that full comparison. An exploratory solution-only run of [7a8ba00](https://github.com/BAITC-Hacks/hack-d5eb16fb-atlas-solutions/commit/7a8ba00) gave **61.95 s, 4460 MiB (4.36 GiB), eval 2.04968**, own share **17.72%**, and **50/50 GPU tests**. It uses compact projections, paired NF4 decoding and a 768 MiB cache budget. That single run cannot establish the base-dependent rule checks. Later commits require fresh measurement.
+
+## Implementation
+
+**Head, loss and metrics.** `ck_head.py` processes 256 rows at a time instead of retaining full logits over 151936 vocabulary entries. cuBLAS multiplies fp16 hidden states and head weights with fp32 output. A streaming Triton reduction obtains logsumexp, NLL, entropy and argmax. The same NLL feeds loss and rewind. The local hidden derivative is computed while logits are live, carrying the current AMP scale; backward scatters it with the actual incoming scale. It does not recompute logits in backward.
+
+The head keeps the union of attention-masked rows and rows needed by shifted labels. A padding query can predict a real token, so the attention mask alone is insufficient. Labelled rows are put first inside the head to compact gradient GEMMs, without changing sample order.
+
+**Frozen head/embedding storage.** The original fp32 master remains intact on CPU; a fp16 compute copy stays on GPU. For tied embeddings this is enabled only if converting the copy back to fp32 exactly reproduces the master. An own lookup kernel emits those original fp32 embedding values. Stock no-grad forwards and disengagement restore the master. External adapter evaluation uses vanilla transformers/PEFT without our code.
+
+**NF4 and paired MLP.** Our decoder fuses NF4 lookup, double-quant scale decoding and offset addition, using the original codebooks. Tests require bitwise equality to bitsandbytes decoding. A separate kernel decodes gate/up directly into a combined matrix: one forward projection GEMM and one input-gradient GEMM replace two of each. The versioned fp16 cache now has a fixed 512 MiB budget. Uncached pairs are decoded on demand, not retained in autograd. Packed model weights remain frozen.
+
+**Saved activations.** Forward uses the original fp16 gate/up values. Only backward storage is compressed to symmetric INT8 with a fp32 scale per 1024 values. RMSNorm saves fp16 input plus its original fp32 inverse standard deviation. These are small backward approximations, not bitwise-equivalence claims. Gradient tests and the complete public loss/metric/eval checks bound their observed effect; hidden quality remains to be checked by the jury.
+
+**Padding.** `integrate.py` trims all-padding edge columns and retains original position ids. `ck_padding.py` compacts real token rows in frozen MLPs and base NF4 projections, retaining a few pad rows to align row counts to eight. Attention and LoRA/dropout keep their full batch shapes. A shifted label requiring a padding query disables row compaction for that batch. Checkpoint replay and cached decoding retain full rows. No rows move between batches. Own gather/scatter kernels restore layouts; another fuses MLP scatter with residual addition.
+
+**Other fusion.** RMSNorm has own forward/backward kernels. The latest RoPE rotates Q and K together in one launch per direction, supporting GQA and strided views. LoRA scale/add preserves PEFT's two fp16 rounding points. Native PyTorch dropout generates its original mask; our kernels pack it to bits and combine packing with the following fp16 cast. Tests compare outputs, gradients and the subsequent CUDA RNG stream.
+
+## Own kernels
+
+| File | Own kernels | Work |
 |---|---|---|
-| `_ck_rms_fwd_kernel` / `_ck_rms_bwd_kernel` | `solution/ck_rms.py` | element-wise chain of `Qwen2RMSNorm` (upcast, pow, mean, rsqrt, weight-mul, dtype casts) — one fused pass per row, forward emits fp16 directly (the value the fp16 autocast cast produces), residual stream stays fp32 |
-| `_ck_rope_fwd_kernel` / `_ck_rope_bwd_kernel` | `solution/ck_rope.py` | `apply_rotary_pos_emb` (q * cos + rotate_half(q) * sin on q and k, fp32 math, fp16 out) with the inverse-rotary backward |
-| `_ck_cast_kernel` | `solution/ck_head.py` | fp32→fp16 cast of the frozen lm_head weight into a cached fp16 copy (values equal to the autocast-cast weight the reference matmul uses) |
-| `_ck_lse_kernel` | `solution/ck_head.py` | one program per row over the 128-row cuBLAS logits piece: max/argmax, sum(exp), entropy — produces per-row logsumexp, NLL and raw entropy without a full fp32 logits tensor |
-| `_ck_ce_lse_kernel` / `_ck_ce_grad_kernel` | `solution/ck_head.py` | computes the normalizer and scaled softmax gradient for recomputed labelled logits, without materializing fp32 logits or probabilities |
-| `_ck_select_logits_kernel` | `solution/ck_head.py` | gathers labelled rows of fp16 logits directly into the fp32 tensor consumed by stock cross-entropy |
+| `ck_head.py` | `_ck_cast_kernel`, `_ck_embedding_kernel`, `_ck_lse_kernel`, `_ck_ce_grad_kernel`, `_ck_scatter_grad_kernel` | Cast, lookup, loss/metrics, CE derivative and gradient scatter |
+| `ck_nf4.py` | `_ck_nf4_kernel`, `_ck_nf4_pair_kernel` | Exact single/paired NF4 decoding |
+| `ck_rms.py` | `_ck_rms_fwd_kernel`, `_ck_rms_bwd_kernel` | RMSNorm and dtype boundaries |
+| `ck_residual_norm.py` | `_ck_residual_norm_fwd_kernel`, `_ck_residual_norm_bwd_kernel` | Attention residual, compact MLP RMSNorm and joint gradient |
+| `ck_rope.py` | `_ck_rope_pair_kernel` | Joint Q/K rotation and backward |
+| `ck_lora.py` | `_ck_lora_add_kernel`, `_ck_lora_grad_kernel` | Adapter scale/add and gradient |
+| `ck_dropout.py` | `_ck_dropout_pack_kernel`, `_ck_dropout_bwd_kernel` | Native-mask packing/cast and gradient |
+| `ck_activation.py` | `_ck_pack_activations_kernel` | Compact backward activation storage |
+| `ck_padding.py` | `_ck_mlp_residual_kernel`, `_ck_gather_rows_kernel`, `_ck_scatter_rows_kernel` | Compact row movement and residual addition |
 
-The large forward/backward logits GEMMs and `dH = dlogits_piece @ W16` stay
-cuBLAS matmuls, done piece by piece so only one 128-row piece is alive at a time.
-No full logits buffer is stored. A handwritten large-vocab Triton GEMM is much
-slower on a T4 and its compile time alone breaks the wall clock.
+All files above are in `solution/`. `swiglu.py` derives from the starter example: its `example_*` kernels, including compressed-storage and stride adaptations, are excluded from our share. Large GEMMs and SDPA remain PyTorch/cuBLAS work. The unused `_ck_ce_lse_kernel` is not claimed either.
 
-Plus two non-kernel hooks:
+## Reproduce on Kaggle T4
 
-* **K4, batch edge trim** (`solution/integrate.py:_trim_inputs`) — inside
-  `transformers.Trainer._prepare_inputs`: drops only leading/trailing all-padding
-  columns of every batch. Real tokens keep their ids (the window of the original
-  position ids is passed explicitly), attention masks, labels and therefore
-  `num_tokens`, losses, entropy/accuracy and the rewind rows are unchanged.
-* **Metric + rewind wiring** (`solution/integrate.py:_ck_sft_compute_loss`) — while
-  our hook owns the forward, runs `Trainer.compute_loss` and replicates TRL's
-  metric formulas verbatim (entropy over attention-masked rows, `num_tokens`
-  from `attention_mask.sum()`, `mean_token_accuracy` from argmax vs shifted
-  labels) and fills Soup's `_soup_chunked_step` with per-token losses so
-  `rewind.jsonl` stays recordable without full logits.
-
-## Why the head + loss path was the target
-
-The stock run materializes fp16 logits (4 × 512 × 151936), then fp32 copies for
-log_softmax, cross-entropy and the entropy metric — several GB of transient
-buffers per step. This is both the time spent in element-wise passes over the
-whole vocab and the reason `soup train` sits close to the T4's memory ceiling.
-Our chunked path builds one 128-row cuBLAS logits piece (≈ 39 MiB fp16) and owns
-the full-vocab softmax/metrics work with Triton. The backward recomputes one
-128-row logits piece at a time and feeds it to the dlogits kernel, so peak
-memory stays below the stock full-logits path; the large forward/backward logits
-GEMMs and `dH = dlogits @ W16` stay cuBLAS. This removes the reference's fp32
-logits copies without adding a full logits buffer.
-
-## Quality
-
-The loss value, its gradient and every logged metric follow the reference math:
-
-* logits rounding: cuBLAS produces fp16 logits; the loss uses stock fp32
-  cross-entropy and our Triton metric reductions read those fp16 values in
-  fp32. The backward recomputes logits and applies the softmax gradient;
-* the gradient of the mean CE is `(p − onehot) / num_items` with zeros at
-  ignored positions, folded into `den = num_items_in_batch` the Trainer already
-  computes;
-* entropy and accuracy recompute the same per-token quantities as TRL, just in
-  the chunked sweep instead of a full-logits tensor.
-
-## Run it
+Use the template notebook with Internet and T4 x2, the platform repository URL and an exact commit. Pin Soup 0.77.0, transformers 5.16.1, PEFT 0.20.0, TRL 0.29.1, bitsandbytes 0.50.2 and accelerate 1.14.0, as in the template. The harness uses one GPU and requires idle GPUs at the start.
 
 ```bash
-python harness/run_task.py                 # base, then solution -> runs/result.json
-python harness/check_rules.py              # the ten checks against runs/result.json
-python -m pytest tests -q                  # Soup's own tests (they must keep passing)
-python -m pytest solution -q               # our kernels vs plain PyTorch (needs a GPU)
-python harness/run_task.py --profile       # plus a per-kernel CUDA profiler table
+python task/prepare_data.py
+python -m pytest solution -q
+python harness/run_task.py --repeats 2 --out runs_final
+python harness/check_rules.py --result runs_final/result.json
+python harness/score.py runs_final/result.json
 ```
 
-## Results on Kaggle T4
-
-The following is one measured run of commit `83140ca`, before the current
-backward change. Current code must be remeasured; these are not its results.
-
-| | Base Soup | Ours | Ratio |
-|---|---|---|---|
-| Harness wall time, s | 85.27 | 73.23 | 1.164× speedup |
-| Peak GPU memory, MiB | 14,345 | 8,485 | 1.691× lower |
-| Eval loss (public rows) | 2.04969 | 2.04964 | −0.002% |
-
-That run's automatic kernel-share result included the starter-derived SwiGLU,
-so it must not be used as evidence for the 5% own-kernel requirement. The
-current implementation marks both SwiGLU kernels as examples; measure its own
-share and all checks in a fresh run.
-
-Checks: `runs/checks.json`.
-
-## Ideas taken from other work, with links
-
-Our head, normalization and rotary kernels are separate from the starter
-example. The tiled SwiGLU is an adaptation of the starter example and does not
-count as an own kernel. The following ideas are credited:
-
-* chunked fused linear + cross-entropy without materializing full fp32 logits —
-  the idea of Liger-Kernel's `FusedLinearCrossEntropy` (Apache-2.0),
-  https://github.com/linkedin/Liger-Kernel, and of CUTLASS-style blockwise
-  softmax epilogues;
-* streaming max/sum/argmax reductions with a stable logsumexp, in the spirit of
-  FlashAttention's online softmax, https://arxiv.org/abs/2205.14135;
-* the fp16 head-weight cache equals the weight tensor autocast hands to cuBLAS —
-  PyTorch autocast rules, https://pytorch.org/docs/stable/amp.html;
-* TRL's metric formulas (entropy per attention-masked row, `num_tokens`,
-  `mean_token_accuracy`) are replicated verbatim from TRL 0.29.1,
-  `trl/trainer/sft_trainer.py`;
-* the logits-free per-token-loss protocol consumed by Soup's rewind recorder is
-  Soup's own `#1693` chunked-step contract (`soup_cli.utils.stream_loss_chunk`,
-  `soup_cli.trainer.rewind_hf:row_losses_from_token_losses`) — we reuse the
-  contract, not the implementation.
-
-## Repo state
-
-* `solution/` — `ck_rms.py`, `ck_rope.py`, `ck_head.py`, `integrate.py`,
-  `__init__.py` (apply wiring), `swiglu.py` (tiled starter-example adaptation),
-  `test_kernels.py` (our correctness tests).
-* `harness/`, `tests/`, `task/` — untouched.
-* `SUBMISSION.md`, Kaggle notebook link — see SUBMISSION.md.
+Use a new output directory per comparison. During development, `--only solution --out runs_try_<commit>` is faster but cannot establish the base-dependent checks. `--profile` adds a separate profiled run whose wall time is not the solution timing. Imports, cold JIT and adapter saving count in the measured command. The solution does not change the harness allocator, GPU selection or compiler-cache settings, or install packages during measurement.
 
 ## Limits
 
-* Kernels target exactly the Qwen2 geometry of the task (hidden 1536, V = 151936
-  divisible by 128, 28 layers); anything else falls back to stock paths.
-* The fp16 head-weight cache assumes the head is frozen (it is: LoRA does not
-  target it); the cache key includes the weight version counter and re-casts on
-  any change.
-* Trim only removes all-padding edge columns; a batch with interior padding
-  holes is left untouched.
+Optimized paths target frozen NF4 Qwen2 under fp16 autocast on T4. Unsupported layouts/models/PEFT modes use guarded fallbacks. No built-in Soup optimization switch is changed. CPU masters require host RAM and an initial transfer, whose time counts. The fixed cache budget trades memory for repeated decoding. INT8 saved activations and fp16 saved norm inputs are approximate; public results do not guarantee hidden-seed quality or a specific hidden-run time.
+
+## Sources of ideas
+
+New kernels are handwritten; no third-party kernel libraries or kernel implementations are imported/copied:
+
+- Chunked linear/CE and its forward-computed derivative: [Liger fused linear cross-entropy](https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/fused_linear_cross_entropy.py).
+- Stable online softmax: [FlashAttention paper](https://arxiv.org/abs/2205.14135).
+- Paired gate/up projections: [NVIDIA TensorRT-LLM post-load fusion](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/transforms/post_load_fusion.html).
+- Removing padding work: [PyTorch transformer building blocks](https://docs.pytorch.org/tutorials/intermediate/transformer_building_blocks.html).
+- FP16 matrix alignment: [NVIDIA matrix multiplication guide](https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html).
+- Compact dropout state: [Triton low-memory dropout](https://triton-lang.org/main/getting-started/tutorials/04-low-memory-dropout.html). Our path packs the actual native mask and preserves its RNG.
+- NF4 semantics: installed bitsandbytes `QuantState`; dtype boundaries: [PyTorch AMP](https://docs.pytorch.org/docs/stable/amp.html).
+
+TRL 0.29.1 metric formulas and Soup's chunked-step/rewind contract are preserved in the integration. Starter SwiGLU attribution remains explicit in its source. See `LICENSE` and `NOTICE` for Apache-2.0 notices; task data/model retain their original licenses.
