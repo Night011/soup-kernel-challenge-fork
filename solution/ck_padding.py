@@ -80,12 +80,48 @@ def _ck_mlp_residual_kernel(RESIDUAL, PACKED, INVERSE, OUT, N,
 
 
 @triton.jit
-def _ck_mlp_gather_grad_kernel(GRAD, ROWS, OUT, N,
-                               H: tl.constexpr, BLOCK: tl.constexpr):
+def _ck_gather_rows_kernel(GRAD, ROWS, OUT, N,
+                            H: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     row = tl.load(ROWS + i // H, i < N, other=0)
     value = tl.load(GRAD + row * H + i % H, i < N, other=0)
     tl.store(OUT + i, value, i < N)
+
+
+@triton.jit
+def _ck_scatter_rows_kernel(PACKED, INVERSE, OUT, N,
+                             H: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = tl.load(INVERSE + i // H, i < N, other=-1)
+    value = tl.load(PACKED + tl.maximum(row, 0) * H + i % H,
+                    (i < N) & (row >= 0), other=0)
+    tl.store(OUT + i, value, i < N)
+
+
+def projection_layout(hidden):
+    if (_LAYOUT is not None and hidden.ndim == 3 and hidden.is_contiguous()
+            and tuple(hidden.shape[:2]) == _LAYOUT[1]):
+        return _LAYOUT
+    return None
+
+
+def gather_rows(hidden, layout):
+    hidden = hidden.contiguous()
+    rows = layout[0]
+    out = hidden.new_empty((rows.numel(), hidden.shape[-1]))
+    _ck_gather_rows_kernel[(triton.cdiv(out.numel(), 1024),)](
+        hidden, rows, out, out.numel(), H=out.shape[-1], BLOCK=1024, num_warps=4,
+    )
+    return out
+
+
+def scatter_rows(hidden, layout):
+    hidden = hidden.contiguous()
+    out = hidden.new_empty((*layout[1], hidden.shape[-1]))
+    _ck_scatter_rows_kernel[(triton.cdiv(out.numel(), 1024),)](
+        hidden, layout[2], out, out.numel(), H=out.shape[-1], BLOCK=1024, num_warps=4,
+    )
+    return out
 
 
 class CompactMLPResidual(torch.autograd.Function):
@@ -110,7 +146,7 @@ class CompactMLPResidual(torch.autograd.Function):
         grad = grad.contiguous()
         packed_grad = torch.empty(ctx.packed_shape, device=grad.device,
                                    dtype=ctx.packed_dtype)
-        _ck_mlp_gather_grad_kernel[(triton.cdiv(packed_grad.numel(), 1024),)](
+        _ck_gather_rows_kernel[(triton.cdiv(packed_grad.numel(), 1024),)](
             grad, rows, packed_grad, packed_grad.numel(), H=grad.shape[-1],
             BLOCK=1024, num_warps=4,
         )
