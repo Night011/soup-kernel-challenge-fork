@@ -76,10 +76,14 @@ Filled from `runs/result.json` of the final notebook run (see also SUBMISSION.md
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| `soup train` wall time, s | ~79–83 (harness README) | TBD | TBD |
-| Peak GPU memory, MiB | 14,350 | TBD | TBD |
-| Own-kernel share of training time (check 4) | — | TBD (steps 3+, CUDA events) | — |
-| Eval loss (public rows) | 2.050 | TBD | — |
+| Harness wall time, s | 94.1 | 92.16 | 0.979× (faster) |
+| Peak GPU memory, MiB | 14,345 | 8,425 | 1.703× lower |
+| Own-kernel share of training time (check 4) | — | 6.0% (steps 3+, CUDA events) | — |
+| Eval loss (public rows) | 2.04958 | 2.04963 | +0.002% (noise floor) |
+
+All checks pass: check 7 `+0.002%` (limit `+0.5%`), check 8 `time ×0.979`,
+`memory ×0.587` of base (limit `1.10×`), check 4 `6.0%` (limit `5%`),
+check 10 `79 passed`.
 
 Checks: `runs/checks.json`.
 
