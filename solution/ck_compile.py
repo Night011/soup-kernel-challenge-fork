@@ -222,7 +222,7 @@ def prepare_config(cfg, scale=2.0):
                 failures.append((kernel.__name__, type(exc).__name__))
         return failures
 
-    workers = min(4, os.cpu_count() or 1)
+    workers = min(2, os.cpu_count() or 1)
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ck_compile") as pool:
         failures = [failure for result in pool.map(compile_group, groups.values()) for failure in result]
     count = sum(len(group[1]) for group in groups.values())
