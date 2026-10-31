@@ -42,6 +42,7 @@ from .swiglu import patch_qwen2_mlp  # noqa: E402
 from .ck_rms import patch_qwen2_rmsnorm  # noqa: E402
 from .ck_rope import patch_qwen2_rope  # noqa: E402
 from .ck_lora import patch_lora_add  # noqa: E402
+from .ck_nf4 import patch_nf4_decode  # noqa: E402
 from . import integrate  # noqa: E402
 
 
@@ -55,6 +56,7 @@ def apply():
         ("rmsnorm", patch_qwen2_rmsnorm),
         ("rope", patch_qwen2_rope),
         ("lora_add", patch_lora_add),
+        ("nf4", patch_nf4_decode),
         ("integrate", integrate.apply_all),
     ):
         try:
