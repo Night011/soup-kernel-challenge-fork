@@ -15,13 +15,15 @@ from .ck_activation import PACK_BLOCK, pack_activations
 
 class _PairedFrozenMLP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, wgu, packed_down, down_state, compress):
+    def forward(ctx, x, packed_gate, packed_up, packed_down, compress):
         from .swiglu import example_swiglu_fwd_kernel, _SW_BM, _SW_BN
 
         shape, hidden = x.shape, x.shape[-1]
         rows = x.numel() // hidden
+        wgu = ck_nf4.paired_mlp_weights(packed_gate, packed_up)
         width = wgu.shape[0] // 2
         gu = torch.mm(x.view(rows, hidden), wgu.t())
+        del wgu
         gate, up = gu[:, :width], gu[:, width:]
         activation = torch.empty((rows, width), dtype=x.dtype, device=x.device)
         grid = (triton.cdiv(rows, _SW_BM), triton.cdiv(width, _SW_BN))
@@ -29,14 +31,16 @@ class _PairedFrozenMLP(torch.autograd.Function):
             gate, up, activation, rows, width, 2 * width,
             BM=_SW_BM, BN=_SW_BN, num_warps=8, num_stages=2,
         )
-        down = ck_nf4.decode_nf4(packed_down, down_state)
+        down = ck_nf4.decode_nf4(packed_down, packed_down.quant_state)
         result = torch.mm(activation, down.t())
+        del down, activation
         if compress:
             saved_gate, saved_up, sg, su = pack_activations(gate, up)
         else:
             saved_gate, saved_up, sg, su = gate, up, gate, up
-        ctx.save_for_backward(saved_gate, saved_up, sg, su, wgu, packed_down)
-        ctx.down_state = down_state
+        ctx.save_for_backward(saved_gate, saved_up, sg, su, packed_gate, packed_up, packed_down)
+        ctx.pair_states = (packed_gate.quant_state, packed_up.quant_state)
+        ctx.down_state = packed_down.quant_state
         ctx.shape, ctx.width, ctx.compress = shape, width, compress
         return result.view(shape)
 
@@ -44,7 +48,7 @@ class _PairedFrozenMLP(torch.autograd.Function):
     def backward(ctx, grad):
         from .swiglu import example_swiglu_bwd_kernel, _SW_BM, _SW_BN
 
-        gate, up, sg, su, wgu, packed_down = ctx.saved_tensors
+        gate, up, sg, su, packed_gate, packed_up, packed_down = ctx.saved_tensors
         hidden, width = ctx.shape[-1], ctx.width
         grad = grad.contiguous().view(-1, hidden)
         rows = grad.shape[0]
@@ -59,6 +63,7 @@ class _PairedFrozenMLP(torch.autograd.Function):
             BM=_SW_BM, BN=_SW_BN, COMPRESSED=ctx.compress, PACK=PACK_BLOCK,
             num_warps=8, num_stages=2,
         )
+        wgu = ck_nf4.paired_mlp_weights(packed_gate, packed_up, ctx.pair_states)
         dx = torch.mm(dgu, wgu)
         return dx.view(ctx.shape), None, None, None, None
 
@@ -83,7 +88,6 @@ def paired_frozen_mlp(mlp, x, compress=True):
             or gate.quant_state.shape[1] != x.shape[-1]
             or tuple(down.quant_state.shape) != (x.shape[-1], gate.quant_state.shape[0])):
         return None
-    wgu = ck_nf4.paired_mlp_weights(gate, up)
-    if wgu is None:
+    if not ck_nf4.can_pair_weights(gate, up):
         return None
-    return _PairedFrozenMLP.apply(x, wgu, down, down.quant_state, compress)
+    return _PairedFrozenMLP.apply(x, gate, up, down, compress)

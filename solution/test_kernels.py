@@ -116,7 +116,8 @@ def test_nf4_compact_projection_forward_and_backward(with_bias):
 
 
 @pytest.mark.parametrize("compress", [False, True])
-def test_paired_frozen_mlp(compress):
+@pytest.mark.parametrize("cache", [False, True])
+def test_paired_frozen_mlp(compress, cache):
     import bitsandbytes as bnb
     from solution import ck_nf4
     from solution.ck_mlp import paired_frozen_mlp
@@ -142,7 +143,8 @@ def test_paired_frozen_mlp(compress):
     ref = torch.nn.functional.linear(activated, weights[2])
     ref.backward(dy)
     ck_nf4.clear_weight_cache()
-    ck_nf4._CACHEABLE.update([mlp.gate_proj.weight.data_ptr(), mlp.up_proj.weight.data_ptr()])
+    if cache:
+        ck_nf4._CACHEABLE.update([mlp.gate_proj.weight.data_ptr(), mlp.up_proj.weight.data_ptr()])
     try:
         xo = x.clone().requires_grad_()
         out = paired_frozen_mlp(mlp, xo, compress=compress)
@@ -154,6 +156,27 @@ def test_paired_frozen_mlp(compress):
         assert float(error / norm) < (0.015 if compress else 0.002)
     finally:
         ck_nf4.clear_weight_cache()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_paired_nf4_decode_is_exact(nested):
+    import bitsandbytes.functional as functional
+    from solution import ck_nf4
+
+    original = ck_nf4._ORIGINAL_DEQUANT or functional.dequantize_4bit
+    packed = []
+    reference = []
+    for _ in range(2):
+        w = torch.randn(65, 128, device="cuda", dtype=torch.float16)
+        p, state = functional.quantize_4bit(w, blocksize=64,
+                                           compress_statistics=nested, quant_type="nf4")
+        p.quant_state = state
+        packed.append(p)
+        reference.append(original(p, state))
+    ck_nf4.clear_weight_cache()
+    out = ck_nf4.paired_mlp_weights(*packed)
+    torch.testing.assert_close(out, torch.cat(reference), rtol=0, atol=0)
+    assert not ck_nf4._PAIRED, "uncached pairs must be released after each use"
 
 
 @pytest.mark.parametrize("shape", [(1031,), (2, 17, 1536)])
