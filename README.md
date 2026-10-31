@@ -25,6 +25,8 @@ Further development has changed the solution since that full comparison. An expl
 
 The head keeps the union of attention-masked rows and rows needed by shifted labels. A padding query can predict a real token, so the attention mask alone is insufficient. Labelled rows are put first inside the head to compact gradient GEMMs, without changing sample order.
 
+The latest collator wrapper derives those indices, padding layout and token count from the same CPU batch before device transfer. They travel with that batch and are removed from model kwargs. A GPU scalar denominator is loaded inside the CE kernel without a host read. Entropy/accuracy are transferred before TRL writes their normal log entry, rather than blocking inside head backward. GPU preparation remains a fallback when CPU metadata is unavailable.
+
 **Frozen head/embedding storage.** The original fp32 master remains intact on CPU; a fp16 compute copy stays on GPU. For tied embeddings this is enabled only if converting the copy back to fp32 exactly reproduces the master. An own lookup kernel emits those original fp32 embedding values. Stock no-grad forwards and disengagement restore the master. External adapter evaluation uses vanilla transformers/PEFT without our code.
 
 **NF4 and paired MLP.** Our decoder fuses NF4 lookup, double-quant scale decoding and offset addition, using the original codebooks. Tests require bitwise equality to bitsandbytes decoding. A separate kernel decodes gate/up directly into a combined matrix: one forward projection GEMM and one input-gradient GEMM replace two of each. The versioned fp16 cache now has a fixed 512 MiB budget. Uncached pairs are decoded on demand, not retained in autograd. Packed model weights remain frozen.

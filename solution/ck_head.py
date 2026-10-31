@@ -195,7 +195,7 @@ def _ck_ce_lse_kernel(LOGITS, LSE, V, BLOCK: tl.constexpr):
 
 @triton.jit
 def _ck_ce_grad_kernel(LOGITS, LSE, TARGET, DLOGITS, V, DEN, SCALE,
-                       BLOCK: tl.constexpr):
+                       BLOCK: tl.constexpr, DEN_TENSOR: tl.constexpr):
     """Write the scaled fp16 CE gradient for a tile of labelled logits."""
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -203,7 +203,8 @@ def _ck_ce_grad_kernel(LOGITS, LSE, TARGET, DLOGITS, V, DEN, SCALE,
     x = tl.load(LOGITS + row * V + col, mask=mask, other=0.0).to(tl.float32)
     lse = tl.load(LSE + row)
     target = tl.load(TARGET + row)
-    inv_den = tl.load(SCALE) / DEN
+    denominator = tl.load(DEN).to(tl.float32) if DEN_TENSOR else DEN
+    inv_den = tl.load(SCALE) / denominator
     grad = (tl.exp(x - lse) - (col == target).to(tl.float32)) * inv_den
     tl.store(DLOGITS + row * V + col, grad.to(tl.float16), mask=mask)
 
@@ -252,6 +253,7 @@ class CKHeadHook:
     def __init__(self):
         self.trainer = None
         self.step = None
+        self.pending_metrics = []
 
     def take_step(self):
         """The chunked step of the last labelled forward, once (Soup's protocol)."""
@@ -271,8 +273,21 @@ class CKHeadHook:
         m = getattr(trainer, "_metrics", None)
         if m is None or "train" not in m:
             return
+        if isinstance(entropy, torch.Tensor):
+            self.pending_metrics.append((entropy.detach(), accuracy.detach()))
+            return
         m["train"]["entropy"].append(entropy)
         m["train"]["mean_token_accuracy"].append(accuracy)
+
+    def flush_metrics(self, trainer):
+        if not self.pending_metrics:
+            return
+        values = torch.stack([torch.stack(pair) for pair in self.pending_metrics]).cpu().tolist()
+        self.pending_metrics.clear()
+        metrics = trainer._metrics["train"]
+        for entropy, accuracy in values:
+            metrics["entropy"].append(entropy)
+            metrics["mean_token_accuracy"].append(accuracy)
 
 
 def _engage_head_ok(weight, V, K):
@@ -318,21 +333,23 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
     # These are plain index/copy operations, not part of the autograd graph:
     # the custom Function below owns the only gradient path (dH -> X).
     with torch.no_grad():
-        keep = (am != 0) | (tgt != -100)
-        idx_keep = keep.nonzero(as_tuple=False).squeeze(1)
+        prepared = getattr(hook.trainer, "_ck_batch_meta", None)
+        prepared_ok = (prepared is not None and tuple(prepared.get("shape", ())) == (B, S)
+                       and prepared["head_indices"].device == hidden.device)
+        if prepared_ok:
+            idx_keep = prepared["head_indices"]
+            n_lab = prepared["num_labelled"]
+        else:
+            keep = (am != 0) | (tgt != -100)
+            idx_keep = keep.nonzero(as_tuple=False).squeeze(1)
+            tgt_keep = tgt.index_select(0, idx_keep)
+            lab_keep = tgt_keep != -100
+            n_lab = lab_keep.nonzero(as_tuple=False).shape[0]
+            order = torch.argsort(lab_keep.to(torch.uint8), descending=True, stable=True)
+            idx_keep = idx_keep.index_select(0, order)
         n_keep = idx_keep.numel()
-        if n_keep == 0:
+        if n_keep == 0 or n_lab == 0:
             return None
-        tgt_keep = tgt.index_select(0, idx_keep)
-        lab_keep = tgt_keep != -100
-        lab_pos = lab_keep.nonzero(as_tuple=False).squeeze(1)
-        n_lab = lab_pos.numel()
-        if n_lab == 0:
-            return None
-        # Put labelled rows first inside the head only. This keeps every
-        # gradient GEMM compact without per-chunk nonzero synchronizations.
-        order = torch.argsort(lab_keep.to(torch.uint8), descending=True, stable=True)
-        idx_keep = idx_keep.index_select(0, order)
         x_keep = X.index_select(0, idx_keep)
         tgt_keep = tgt.index_select(0, idx_keep)
         am_keep = am.index_select(0, idx_keep)
@@ -344,9 +361,13 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
         return None
     if num_items is None:
         den_val = float(n_lab)
+    elif isinstance(num_items, torch.Tensor):
+        if num_items.numel() != 1:
+            return None
+        den_val = num_items.detach().to(device=X.device, dtype=torch.float32)
     else:
         den_val = float(num_items)
-    if den_val <= 0.0:
+    if not isinstance(den_val, torch.Tensor) and den_val <= 0.0:
         return None
 
     # The scalar CE upstream is known up to AMP scaling. Compute its local
@@ -393,7 +414,8 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
                                           device=x.device)
                     _ck_ce_grad_kernel[(labelled, triton.cdiv(V, 1024))](
                         logits, lse[start:end], tgt_keep[start:end], dlogits,
-                        V, den_val, amp_scale, BLOCK=1024, num_warps=4,
+                        V, den_val, amp_scale, BLOCK=1024,
+                        DEN_TENSOR=isinstance(den_val, torch.Tensor), num_warps=4,
                     )
                     dH_lab[start:start + labelled] = torch.mm(dlogits, w16_in)
                     del dlogits
@@ -423,13 +445,11 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
                 dH_lab, idx_lab_b, grad_out, forward_scale, dH, dH_lab.numel(),
                 H=ctx.K, BLOCK=1024, num_warps=4,
             )
-            am_sum = float(ctx.am_keep.sum().item())
-            ent_mean = float((ctx.ent_keep * ctx.am_keep).sum().item()) / am_sum \
-                if am_sum > 0 else 0.0
+            am_sum = ctx.am_keep.sum().to(torch.float64)
+            ent_mean = (ctx.ent_keep * ctx.am_keep).sum().to(torch.float64) / am_sum.clamp_min(1)
             lab = ctx.lab_keep
             total = int(ctx.n_lab)
-            acc = float(((ctx.amax_keep == ctx.tgt_keep) & lab).sum().item()) / total \
-                if total > 0 else 0.0
+            acc = ((ctx.amax_keep == ctx.tgt_keep) & lab).sum().to(torch.float64) / total
             hook.on_backward_done(hook.trainer, ent_mean, acc)
             return dH, None, None, None
 
