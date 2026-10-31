@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-PACK_BLOCK = 256
+PACK_BLOCK = 1024
 
 
 @triton.jit
