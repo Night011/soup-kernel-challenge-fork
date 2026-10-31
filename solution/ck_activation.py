@@ -12,7 +12,8 @@ PACK_BLOCK = 256
 
 
 @triton.jit
-def _ck_pack_activations_kernel(GATE, UP, QGATE, QUP, SGATE, SUP, N, COLS, STRIDE,
+def _ck_pack_activations_kernel(GATE, UP, QGATE, QUP, SGATE, SUP, N,
+                                 COLS: tl.constexpr, STRIDE: tl.constexpr,
                                  BLOCK: tl.constexpr):
     block = tl.program_id(0)
     i = block * BLOCK + tl.arange(0, BLOCK)
