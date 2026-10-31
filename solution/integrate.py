@@ -197,17 +197,23 @@ def _ck_causal_forward(
         compact_mask = None
     prepared = getattr(getattr(_ACTIVE, "trainer", None), "_ck_batch_meta", None)
     with compact_mlp_rows(compact_mask, labels, prepared=prepared):
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=False if use_cache is None else use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-        )
+        from .ck_packed import packed_transformer
+        outputs = packed_transformer(
+            self.model, input_ids, attention_mask, position_ids, inputs_embeds,
+            prepared if compact_mask is not None else None, past_key_values,
+            output_attentions, output_hidden_states)
+        if outputs is None:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=False if use_cache is None else use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+            )
     hidden = outputs.last_hidden_state
     hook = _ACTIVE
     try:

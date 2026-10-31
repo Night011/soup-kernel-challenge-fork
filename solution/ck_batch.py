@@ -31,6 +31,10 @@ def prepare_metadata(batch):
     if result["_ck_batch_meta"]["mlp_layout"] is not None:
         from .ck_attention import attention_layout_cpu
         result["_ck_batch_meta"]["attention_layout"] = attention_layout_cpu(am, labels)
+        layout = result["_ck_batch_meta"]["attention_layout"]
+        if layout is not None:
+            layout["packed_rows"] = torch.arange(layout["rows"].numel(), dtype=torch.int64)
+            layout["packed_inverse"] = torch.arange(layout["rows"].numel(), dtype=torch.int32)
     return result
 
 

@@ -93,10 +93,15 @@ def patch_lora_add():
             return original(self, x, *args, **kwargs)
         self._check_forward_args(x)
         from .ck_padding import projection_layout
+        from .ck_packed import current_lora_layout, expand_for_dropout
         layout = projection_layout(x)
+        packed_layout = current_lora_layout() if x.ndim == 2 else None
         base = self.base_layer(x)
+        dropout_input = expand_for_dropout(x, packed_layout) if packed_layout is not None else x
         update = self.lora_B[adapter](
-            self.lora_A[adapter](compact_lora_dropout(self.lora_dropout[adapter], x, layout))
+            self.lora_A[adapter](compact_lora_dropout(
+                self.lora_dropout[adapter], dropout_input,
+                packed_layout if packed_layout is not None else layout))
         )
         scale = self.scaling[adapter]
         if (base.is_contiguous() and update.is_contiguous()

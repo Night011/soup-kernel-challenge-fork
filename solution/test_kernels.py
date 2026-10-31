@@ -51,6 +51,47 @@ def test_compact_lora_projection_preserves_rng_and_gradients(out_width):
         torch.testing.assert_close(got.grad, expected.grad, rtol=1e-2, atol=3e-3)
 
 
+def test_packed_transformer_matches_real_tokens_and_input_gradients():
+    import copy
+    import solution
+    from solution.ck_attention import attention_layout_cpu
+    from solution.ck_packed import packed_transformer
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    solution.apply()
+    torch.manual_seed(42)
+    cfg = Qwen2Config(vocab_size=512, hidden_size=512, intermediate_size=1024,
+                     num_hidden_layers=2, num_attention_heads=4,
+                     num_key_value_heads=1, attention_dropout=0.0)
+    cfg._attn_implementation = "sdpa"
+    reference = Qwen2ForCausalLM(cfg).cuda().train().model
+    actual = copy.deepcopy(reference)
+    ids = torch.randint(0, 512, (2, 17), device="cuda")
+    mask = torch.zeros(2, 17, dtype=torch.long)
+    mask[0, :13], mask[1, :9] = 1, 1
+    labels = ids.cpu().clone()
+    labels[mask == 0] = -100
+    labels[:, 0] = -100
+    layout = attention_layout_cpu(mask, labels)
+    layout["packed_rows"] = torch.arange(layout["rows"].numel())
+    layout["packed_inverse"] = torch.arange(layout["rows"].numel(), dtype=torch.int32)
+    layout = {key: value.cuda() if isinstance(value, torch.Tensor) else value
+              for key, value in layout.items()}
+    mask = mask.cuda()
+    gradient = torch.randn(2, 17, 512, device="cuda") * mask[:, :, None]
+    with torch.autocast("cuda", dtype=torch.float16):
+        ref = reference(input_ids=ids, attention_mask=mask, use_cache=False).last_hidden_state
+    ref.backward(gradient)
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = packed_transformer(actual, ids, mask, None, None, {"attention_layout": layout})
+    assert out is not None
+    out.last_hidden_state.backward(gradient)
+    torch.testing.assert_close(out.last_hidden_state[mask.bool()], ref[mask.bool()],
+                               rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual.embed_tokens.weight.grad,
+                               reference.embed_tokens.weight.grad, rtol=3e-2, atol=2e-2)
+
+
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("shape", [(65, 128), (1536, 1536)])
 def test_nf4_decode_matches_bitsandbytes(nested, shape):

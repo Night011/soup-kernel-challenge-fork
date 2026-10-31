@@ -82,7 +82,7 @@ def prepare_config(cfg, scale=2.0):
             COMPACT=compact, BLOCK=1024)
     add(activation._ck_pack_activations_kernel, (half, half, i8, i8, f, f, 1024 * width),
         COLS=width, STRIDE=2 * width, BLOCK=activation.PACK_BLOCK)
-    for rows in (1024, 1032):
+    for rows in (1024, 1032, 1023):
         add(swiglu.example_swiglu_fwd_kernel, (half, half, half, rows, width, 2 * width),
             BM=swiglu._SW_BM, BN=swiglu._SW_BN, num_warps=8, num_stages=2)
         add(swiglu.example_swiglu_bwd_kernel,
@@ -106,9 +106,11 @@ def prepare_config(cfg, scale=2.0):
         for sequence in (512, 511):
             qb, qh, qs = (sequence * h, sequence * dim, dim) if backward else (sequence * h, dim, h)
             kb, kh, ks = (sequence * kv, sequence * dim, dim) if backward else (sequence * kv, dim, kv)
-            add(rope._ck_rope_pair_kernel,
-                (f, f, f, f, f, f, sequence, hq, hk, qb, qh, qs, kb, kh, ks, 0, dim, 0, dim),
-                RD=dim, BR=rope._ROPE_ROWS, BACKWARD=backward)
+            for table_batch in (0, sequence * dim):
+                add(rope._ck_rope_pair_kernel,
+                    (f, f, f, f, f, f, sequence, hq, hk, qb, qh, qs, kb, kh, ks,
+                     table_batch, dim, table_batch, dim),
+                    RD=dim, BR=rope._ROPE_ROWS, BACKWARD=backward)
     for sequence in (512, 511):
         add(attention._ck_attention_pack_kernel,
             (f, f, f, i64, half, half, half, 1024 * hq * dim, sequence,
