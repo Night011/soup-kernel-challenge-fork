@@ -29,18 +29,12 @@ def _ck_rms_fwd_kernel(X, W, Y, eps, H: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     base = row * H
     offs = tl.arange(0, BLOCK)
-    acc = tl.zeros([BLOCK], dtype=tl.float32)
-    for i in tl.static_range(H // BLOCK):
-        x = tl.load(X + base + i * BLOCK + offs).to(tl.float32)
-        acc += x * x
-    var = tl.sum(acc, axis=0) / H
+    x = tl.load(X + base + offs, offs < H, other=0.0).to(tl.float32)
+    w = tl.load(W + offs, offs < H, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=0) / H
     r = tl.rsqrt(var + eps)
-    for i in tl.static_range(H // BLOCK):
-        d = i * BLOCK + offs
-        x = tl.load(X + base + d).to(tl.float32)
-        w = tl.load(W + d).to(tl.float32)
-        y = w * (x * r)
-        tl.store(Y + base + d, y.to(Y.dtype.element_ty))
+    y = w * (x * r)
+    tl.store(Y + base + offs, y.to(Y.dtype.element_ty), offs < H)
 
 
 # y_j = w_j * x_j * r, где r = (mean(x^2) + eps)^(-1/2).
@@ -56,27 +50,16 @@ def _ck_rms_bwd_kernel(X, DY, W, DX, eps, H: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     base = row * H
     offs = tl.arange(0, BLOCK)
-    acc_xx = tl.zeros([BLOCK], dtype=tl.float32)
-    acc_gx = tl.zeros([BLOCK], dtype=tl.float32)
-    for i in tl.static_range(H // BLOCK):
-        d = i * BLOCK + offs
-        x = tl.load(X + base + d).to(tl.float32)
-        dy = tl.load(DY + base + d).to(tl.float32)
-        w = tl.load(W + d).to(tl.float32)
-        acc_xx += x * x
-        acc_gx += x * w * dy
-    m = tl.sum(acc_xx, axis=0) / H
-    s = tl.sum(acc_gx, axis=0)
+    x = tl.load(X + base + offs, offs < H, other=0.0).to(tl.float32)
+    dy = tl.load(DY + base + offs, offs < H, other=0.0).to(tl.float32)
+    w = tl.load(W + offs, offs < H, other=0.0).to(tl.float32)
+    m = tl.sum(x * x, axis=0) / H
+    s = tl.sum(x * w * dy, axis=0)
     r = tl.rsqrt(m + eps)
     # coef = r^3 / H; второе слагаемое — вклад производной r по x_k.
     coef = r * r * r / H
-    for i in tl.static_range(H // BLOCK):
-        d = i * BLOCK + offs
-        x = tl.load(X + base + d).to(tl.float32)
-        dy = tl.load(DY + base + d).to(tl.float32)
-        w = tl.load(W + d).to(tl.float32)
-        dx = r * w * dy - coef * x * s
-        tl.store(DX + base + d, dx.to(DX.dtype.element_ty))
+    dx = r * w * dy - coef * x * s
+    tl.store(DX + base + offs, dx.to(DX.dtype.element_ty), offs < H)
 
 
 class CKRMSNormFn(torch.autograd.Function):
@@ -88,7 +71,8 @@ class CKRMSNormFn(torch.autograd.Function):
         hidden = weight.numel()
         y = torch.empty_like(x, dtype=torch.float16 if output_fp16 else x.dtype).view(rows, hidden)
         _ck_rms_fwd_kernel[(rows,)](
-            x, weight, y, eps, H=hidden, BLOCK=_RMS_BLOCK, num_warps=4, num_stages=2
+            x, weight, y, eps, H=hidden, BLOCK=triton.next_power_of_2(hidden),
+            num_warps=4, num_stages=2,
         )
         ctx.save_for_backward(x, weight)
         ctx.eps = eps
@@ -102,7 +86,7 @@ class CKRMSNormFn(torch.autograd.Function):
         grad = grad_out.contiguous().view(rows, hidden)
         dx = torch.empty_like(x).view(rows, hidden)
         _ck_rms_bwd_kernel[(rows,)](
-            x, grad, weight, dx, ctx.eps, H=hidden, BLOCK=_RMS_BLOCK,
+            x, grad, weight, dx, ctx.eps, H=hidden, BLOCK=triton.next_power_of_2(hidden),
             num_warps=4, num_stages=2,
         )
         return (dx.view_as(x), None, None, None)[:len(ctx.needs_input_grad)]

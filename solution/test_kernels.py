@@ -50,6 +50,33 @@ def test_lora_add_matches_pytorch(base_dtype, scale):
     torch.testing.assert_close(uo.grad, ur.grad, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("vocab", [512, 151936])
+def test_streamed_head_statistics(dtype, vocab):
+    """Online entropy/LSE with a masked vocabulary tail and offset logits."""
+    import solution.ck_head as head
+
+    torch.manual_seed(10)
+    logits = torch.randn(4, vocab, device="cuda", dtype=dtype) * 2
+    logits[2] += 1000
+    logits[3].fill_(4)
+    target = torch.tensor([0, vocab - 1, -100, 1], device="cuda", dtype=torch.int32)
+    lse, nll, entropy = [torch.empty(4, device="cuda") for _ in range(3)]
+    amax = torch.empty(4, device="cuda", dtype=torch.int32)
+    head._ck_lse_kernel[(4,)](logits, target, lse, amax, nll, entropy,
+                              vocab, BLOCK=head._BLOCK, num_warps=4)
+    z = logits.float()
+    expected_lse = z.logsumexp(-1)
+    log_probs = z.log_softmax(-1)
+    expected_entropy = -(log_probs.exp() * log_probs).sum(-1)
+    expected_nll = -log_probs[torch.arange(4, device="cuda"), target.clamp_min(0).long()]
+    expected_nll[target == -100] = 0
+    torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=2e-4)
+    torch.testing.assert_close(nll, expected_nll, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(entropy, expected_entropy, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(amax, z.argmax(-1).int(), rtol=0, atol=0)
+
+
 def test_swiglu_matches_pytorch():
     """The starter-derived tiled SwiGLU vs the fp32 PyTorch formula."""
     from solution.swiglu import swiglu

@@ -41,7 +41,7 @@ import triton.language as tl
 _BN = 64
 _BK = 64
 _CH = 256
-_BLOCK = 256
+_BLOCK = 4096
 
 _W16 = {"key": None, "tensor": None}
 
@@ -135,8 +135,8 @@ def _ck_lse_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, V,
                    BLOCK: tl.constexpr):
     """Per-row logsumexp + argmax + NLL + entropy.
 
-    Two streaming passes over one row compute a numerically stable online
-    logsumexp/argmax followed by entropy. Only rows kept by the mask/target
+    One streaming pass accumulates sum(exp) and sum(x*exp) under the same
+    online maximum. Only rows kept by the mask/target
     union reach it; the caller applies the attention-mask weight when averaging
     entropy.
     """
@@ -145,6 +145,7 @@ def _ck_lse_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, V,
 
     mx = float("-inf")
     sm = 0.0
+    weighted = 0.0
     amax = 0
     for v0 in range(0, V, BLOCK):
         offs = v0 + tl.arange(0, BLOCK)
@@ -153,7 +154,11 @@ def _ck_lse_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, V,
         bmax = tl.max(x, axis=0)
         bidx = tl.argmax(x, axis=0)
         new_mx = tl.maximum(mx, bmax)
-        sm = sm * tl.exp(mx - new_mx) + tl.sum(tl.exp(x - new_mx), axis=0)
+        rescale = tl.exp(mx - new_mx)
+        probabilities = tl.exp(x - new_mx)
+        sm = sm * rescale + tl.sum(probabilities, axis=0)
+        weighted = weighted * rescale + tl.sum(
+            probabilities * tl.where(mask, x, 0.0), axis=0)
         amax = tl.where(bmax > mx, v0 + bidx, amax)
         mx = new_mx
 
@@ -164,13 +169,7 @@ def _ck_lse_kernel(LOGITS, TGT, LSE, AMAX, NLL, ENT, V,
     tlog = tl.load(row + tgt_safe).to(tl.float32)
     nll = tl.where(valid, lse - tlog, 0.0)
 
-    ent = 0.0
-    for v0 in range(0, V, BLOCK):
-        offs = v0 + tl.arange(0, BLOCK)
-        mask = offs < V
-        x = tl.load(row + offs, mask=mask, other=0.0).to(tl.float32)
-        p = tl.where(mask, tl.exp(x - lse), 0.0)
-        ent += tl.sum(p * (lse - x), axis=0)
+    ent = tl.maximum(lse - weighted / sm, 0.0)
 
     tl.store(LSE + r, lse)
     tl.store(AMAX + r, amax)
@@ -386,7 +385,7 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
                 _ck_lse_kernel[(nrows,)](
                     logits, tgt_keep[start:end], lse[start:end],
                     amax[start:end], nll[start:end], ent[start:end],
-                    V, BLOCK=_BLOCK, num_warps=2, num_stages=1,
+                    V, BLOCK=_BLOCK, num_warps=4, num_stages=1,
                 )
                 labelled = max(0, min(end, n_lab) - start)
                 if labelled:
