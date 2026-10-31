@@ -41,6 +41,7 @@ _setup_triton_cache()
 from .swiglu import patch_qwen2_mlp  # noqa: E402
 from .ck_rms import patch_qwen2_rmsnorm  # noqa: E402
 from .ck_rope import patch_qwen2_rope  # noqa: E402
+from .ck_lora import patch_lora_add  # noqa: E402
 from . import integrate  # noqa: E402
 
 
@@ -53,6 +54,7 @@ def apply():
         ("swiglu", patch_qwen2_mlp),
         ("rmsnorm", patch_qwen2_rmsnorm),
         ("rope", patch_qwen2_rope),
+        ("lora_add", patch_lora_add),
         ("integrate", integrate.apply_all),
     ):
         try:
