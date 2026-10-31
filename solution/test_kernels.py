@@ -10,6 +10,47 @@ torch = pytest.importorskip("torch")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
 
+@pytest.mark.parametrize("out_width", [128, 512])
+def test_compact_lora_projection_preserves_rng_and_gradients(out_width):
+    from solution.ck_dropout import compact_lora_dropout
+    from solution.ck_lora import CKLoRAAddFn
+
+    torch.manual_seed(39)
+    shape = (2, 13, 512)
+    rows = torch.tensor([0, 1, 2, 7, 8, 13, 14, 15, 20, 21, 22], device="cuda")
+    inverse = torch.full((26,), -1, device="cuda", dtype=torch.int32)
+    inverse[rows] = torch.arange(rows.numel(), device="cuda", dtype=torch.int32)
+    layout = (rows, shape[:2], inverse)
+    original = [torch.randn(shape, device="cuda"),
+                torch.randn(16, 512, device="cuda") * .03,
+                torch.randn(out_width, 16, device="cuda") * .03,
+                torch.randn(2, 13, out_width, device="cuda")]
+    grad = torch.randn_like(original[3])
+    grad.view(-1, out_width)[inverse < 0] = 0
+    reference = [t.clone().requires_grad_() for t in original]
+    actual = [t.clone().requires_grad_() for t in original]
+    dropout = torch.nn.Dropout(.05).train()
+    rng = torch.cuda.get_rng_state()
+    with torch.autocast("cuda", dtype=torch.float16):
+        x, a, b, base = reference
+        update = torch.nn.functional.linear(torch.nn.functional.linear(dropout(x), a), b)
+        ref = base + update * 2.0
+    ref.backward(grad)
+    after_reference = torch.cuda.get_rng_state()
+    torch.cuda.set_rng_state(rng)
+    with torch.autocast("cuda", dtype=torch.float16):
+        x, a, b, base = actual
+        packed = compact_lora_dropout(dropout, x, layout)
+        update = torch.nn.functional.linear(torch.nn.functional.linear(packed, a), b)
+        out = CKLoRAAddFn.apply(base, update, 2.0, layout)
+    out.backward(grad)
+    assert torch.equal(torch.cuda.get_rng_state(), after_reference)
+    torch.testing.assert_close(out.view(-1, out_width)[rows], ref.view(-1, out_width)[rows],
+                               rtol=2e-3, atol=2e-3)
+    for got, expected in zip(actual, reference):
+        torch.testing.assert_close(got.grad, expected.grad, rtol=1e-2, atol=3e-3)
+
+
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("shape", [(65, 128), (1536, 1536)])
 def test_nf4_decode_matches_bitsandbytes(nested, shape):

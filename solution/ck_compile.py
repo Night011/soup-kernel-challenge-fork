@@ -71,11 +71,15 @@ def prepare_config(cfg, scale=2.0):
         NESTED=True, BLOCK=1024, enable_fp_fusion=False)
     add(nf4._ck_nf4_pair_kernel, (u8, u8, u8, u8, f, f, f, f, f, f, f, f, half, h * width),
         NESTED=True, BLOCK=1024, enable_fp_fusion=False)
-    add(lora._ck_lora_add_kernel, (f, half, f, 1024 * h),
-        SCALE=scale, BLOCK=1024, enable_fp_fusion=False)
-    add(lora._ck_lora_grad_kernel, (f, half, 1024 * h), SCALE=scale, BLOCK=1024)
-    add(dropout._ck_dropout_pack_kernel, (f, boolean, half, u8, 1024 * h), BLOCK=1024)
-    add(dropout._ck_dropout_bwd_kernel, (half, u8, f, 1024 * h, 1.0 / 0.95), BLOCK=1024)
+    for compact in (False, True):
+        add(lora._ck_lora_add_kernel, (f, half, f, 1024 * h, i32 if compact else f, h),
+            COMPACT=compact, SCALE=scale, BLOCK=1024, enable_fp_fusion=False)
+        add(lora._ck_lora_grad_kernel, (f, half, 1024 * h, i64 if compact else f, h),
+            COMPACT=compact, SCALE=scale, BLOCK=1024)
+        add(dropout._ck_dropout_pack_kernel, (f, boolean, half, u8, 1024 * h, i32 if compact else u8, h),
+            COMPACT=compact, BLOCK=1024)
+        add(dropout._ck_dropout_bwd_kernel, (half, u8, f, 1024 * h, 1.0 / 0.95, i32 if compact else u8, h),
+            COMPACT=compact, BLOCK=1024)
     add(activation._ck_pack_activations_kernel, (half, half, i8, i8, f, f, 1024 * width),
         COLS=width, STRIDE=2 * width, BLOCK=activation.PACK_BLOCK)
     for rows in (1024, 1032):
