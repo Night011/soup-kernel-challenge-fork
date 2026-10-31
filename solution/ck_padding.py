@@ -8,6 +8,8 @@ keys, so keeping only its last-layer MLP would not preserve its history.
 from contextlib import contextmanager
 
 import torch
+import triton
+import triton.language as tl
 
 _LAYOUT = None
 
@@ -30,7 +32,9 @@ def mlp_layout(attention_mask, labels):
     if extra:
         padding = (~active).flatten().nonzero().flatten()[:extra]
         rows = torch.cat((rows, padding)).sort().values
-    return rows, tuple(active.shape)
+    inverse = torch.full((total,), -1, device=rows.device, dtype=torch.int32)
+    inverse[rows] = torch.arange(rows.numel(), device=rows.device, dtype=torch.int32)
+    return rows, tuple(active.shape), inverse
 
 
 @contextmanager
@@ -57,6 +61,102 @@ def scatter_mlp_rows(mlp, hidden):
     if (layout is None or not getattr(mlp, "_ck_compact_mlp", False)
             or hidden.ndim != 2 or hidden.shape[0] != layout[0].numel()):
         return hidden
-    rows, (batch, sequence) = layout
+    if getattr(mlp, "_ck_fused_residual", False):
+        return hidden
+    rows, (batch, sequence) = layout[:2]
     full = hidden.new_zeros((batch * sequence, hidden.shape[-1]))
     return full.index_copy_(0, rows, hidden).view(batch, sequence, -1)
+
+
+@triton.jit
+def _ck_mlp_residual_kernel(RESIDUAL, PACKED, INVERSE, OUT, N,
+                            H: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    packed_row = tl.load(INVERSE + i // H, i < N, other=-1)
+    value = tl.load(PACKED + tl.maximum(packed_row, 0) * H + i % H,
+                    (i < N) & (packed_row >= 0), other=0).to(tl.float32)
+    residual = tl.load(RESIDUAL + i, i < N, other=0).to(tl.float32)
+    tl.store(OUT + i, residual + value, i < N)
+
+
+@triton.jit
+def _ck_mlp_gather_grad_kernel(GRAD, ROWS, OUT, N,
+                               H: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = tl.load(ROWS + i // H, i < N, other=0)
+    value = tl.load(GRAD + row * H + i % H, i < N, other=0)
+    tl.store(OUT + i, value, i < N)
+
+
+class CompactMLPResidual(torch.autograd.Function):
+    """Scatter plus residual addition in one pass, without a padded MLP buffer."""
+
+    @staticmethod
+    def forward(ctx, residual, packed, rows, inverse):
+        residual, packed = residual.contiguous(), packed.contiguous()
+        out = torch.empty_like(residual)
+        hidden = residual.shape[-1]
+        _ck_mlp_residual_kernel[(triton.cdiv(out.numel(), 1024),)](
+            residual, packed, inverse, out, out.numel(), H=hidden, BLOCK=1024,
+            num_warps=4,
+        )
+        ctx.save_for_backward(rows)
+        ctx.packed_shape, ctx.packed_dtype = packed.shape, packed.dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        rows, = ctx.saved_tensors
+        grad = grad.contiguous()
+        packed_grad = torch.empty(ctx.packed_shape, device=grad.device,
+                                   dtype=ctx.packed_dtype)
+        _ck_mlp_gather_grad_kernel[(triton.cdiv(packed_grad.numel(), 1024),)](
+            grad, rows, packed_grad, packed_grad.numel(), H=grad.shape[-1],
+            BLOCK=1024, num_warps=4,
+        )
+        return grad, packed_grad, None, None
+
+
+def _compact_decoder_forward(self, hidden_states, attention_mask=None,
+                              position_ids=None, past_key_values=None,
+                              use_cache=False, position_embeddings=None, **kwargs):
+    layout = _LAYOUT
+    if (layout is None or hidden_states.ndim != 3
+            or tuple(hidden_states.shape[:2]) != layout[1]):
+        return self._ck_decoder_original(
+            hidden_states, attention_mask=attention_mask, position_ids=position_ids,
+            past_key_values=past_key_values, use_cache=use_cache,
+            position_embeddings=position_embeddings, **kwargs)
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+    hidden_states, _ = self.self_attn(
+        hidden_states=hidden_states, attention_mask=attention_mask,
+        position_ids=position_ids, past_key_values=past_key_values,
+        use_cache=use_cache, position_embeddings=position_embeddings, **kwargs)
+    hidden_states = residual + hidden_states
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    return CompactMLPResidual.apply(residual, hidden_states, layout[0], layout[2])
+
+
+def install_fused_residual(layer):
+    import inspect
+    import types
+
+    original = layer.forward
+    # Older transformers return a tuple and have a different layer contract.
+    if inspect.signature(original).return_annotation not in (torch.Tensor, "torch.Tensor"):
+        return False
+    layer._ck_decoder_original = original
+    layer.forward = types.MethodType(_compact_decoder_forward, layer)
+    layer.mlp._ck_fused_residual = True
+    return True
+
+
+def remove_fused_residual(layer):
+    original = getattr(layer, "_ck_decoder_original", None)
+    if original is not None:
+        layer.forward = original
+        del layer._ck_decoder_original
+    layer.mlp._ck_fused_residual = False
