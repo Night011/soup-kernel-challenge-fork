@@ -378,7 +378,11 @@ def ck_chunked_lm_loss(hidden, labels, weight, attention_mask, num_items, hook):
             for start in range(0, n_keep, _CH):
                 end = min(start + _CH, n_keep)
                 nrows = end - start
-                logits = torch.mm(x_keep[start:end], wt)
+                # Tensor cores accumulate fp16 products in fp32. Keep that
+                # output precision through the loss instead of rounding the
+                # logits to fp16 before softmax.
+                with torch.autocast("cuda", enabled=False):
+                    logits = torch.mm(x_keep[start:end], wt, out_dtype=torch.float32)
                 _ck_lse_kernel[(nrows,)](
                     logits, tgt_keep[start:end], lse[start:end],
                     amax[start:end], nll[start:end], ent[start:end],
