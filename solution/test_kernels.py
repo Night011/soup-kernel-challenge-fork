@@ -48,7 +48,12 @@ def test_compact_lora_projection_preserves_rng_and_gradients(out_width):
     torch.testing.assert_close(out.view(-1, out_width)[rows], ref.view(-1, out_width)[rows],
                                rtol=2e-3, atol=2e-3)
     for got, expected in zip(actual, reference):
-        torch.testing.assert_close(got.grad, expected.grad, rtol=1e-2, atol=3e-3)
+        # Removing zero-contribution GEMM rows changes fp16 reduction order.
+        # Bound the complete gradient error, including near-zero entries.
+        delta = got.grad.float() - expected.grad.float()
+        assert torch.isfinite(got.grad).all()
+        assert float(delta.norm() / expected.grad.float().norm().clamp_min(1e-8)) < .005
+        assert float(delta.abs().max() / expected.grad.abs().max().clamp_min(1e-8)) < .01
 
 
 def test_packed_transformer_matches_real_tokens_and_input_gradients():
@@ -88,8 +93,11 @@ def test_packed_transformer_matches_real_tokens_and_input_gradients():
     out.last_hidden_state.backward(gradient)
     torch.testing.assert_close(out.last_hidden_state[mask.bool()], ref[mask.bool()],
                                rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(actual.embed_tokens.weight.grad,
-                               reference.embed_tokens.weight.grad, rtol=3e-2, atol=2e-2)
+    gradient = actual.embed_tokens.weight.grad.float()
+    expected = reference.embed_tokens.weight.grad.float()
+    assert torch.isfinite(gradient).all()
+    assert float((gradient - expected).norm() / expected.norm()) < .005
+    assert float((gradient - expected).abs().max() / expected.abs().max()) < .01
 
 
 @pytest.mark.parametrize("nested", [False, True])
