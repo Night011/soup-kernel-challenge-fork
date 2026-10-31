@@ -74,6 +74,14 @@ def _rope_one(x, cos, sin, back, grad=None):
 class CKRopeFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, cos, sin):
+        # The Triton indexing below assumes dense (B, S, RD) tables.  The
+        # model/test may supply broadcast views produced by expand().  This is
+        # unreachable for Qwen2 GQA (which takes the stock fallback above),
+        # but keeps the supported equal-head kernel numerically correct.
+        if not cos.is_contiguous():
+            cos = cos.contiguous()
+        if not sin.is_contiguous():
+            sin = sin.contiguous()
         qy = _rope_one(q, cos, sin, back=False)
         ky = _rope_one(k, cos, sin, back=False)
         ctx.save_for_backward(cos, sin)
