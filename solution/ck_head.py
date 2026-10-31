@@ -49,6 +49,44 @@ _BLOCK = 256
 _W16 = {"key": None, "tensor": None}
 
 
+def _weight_key(weight):
+    return (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
+
+
+def offload_frozen_head(lm):
+    """Keep the exact fp32 master on CPU while the frozen head uses its cache.
+
+    Called at the first labelled forward, after Accelerate has placed the
+    model. Shared embedding/head storage is deliberately excluded.
+    """
+    weight = lm.lm_head.weight
+    if (not weight.is_cuda or weight.dtype != torch.float32
+            or weight.requires_grad or not weight.is_contiguous()
+            or weight.shape[0] % _BN or weight.shape[1] % _BK):
+        return
+    embedding = lm.get_input_embeddings().weight
+    if embedding is weight or embedding.data_ptr() == weight.data_ptr():
+        return
+    _w16_for(weight)
+    lm._ck_head_gpu_device = weight.device
+    weight.data = weight.detach().cpu()
+    _W16["key"] = _weight_key(weight)
+    lm._ck_head_offloaded = True
+    print("[ck] frozen fp32 head offloaded to CPU; fp16 compute copy on GPU", flush=True)
+
+
+def restore_frozen_head(lm):
+    """Restore the original parameter, with no rounding, for stock forwards."""
+    if not getattr(lm, "_ck_head_offloaded", False):
+        return
+    weight = lm.lm_head.weight
+    old_key = _weight_key(weight)
+    weight.data = weight.data.to(lm._ck_head_gpu_device)
+    if _W16["key"] == old_key:
+        _W16["key"] = _weight_key(weight)
+    lm._ck_head_offloaded = False
+
+
 @triton.jit
 def _ck_cast_kernel(SRC, DST, n, BLOCK: tl.constexpr):
     i = tl.program_id(0).to(tl.int64) * BLOCK
@@ -148,7 +186,7 @@ def _ck_select_logits_kernel(LOGITS, ROWS, OUT, V, BLOCK: tl.constexpr):
 
 def _w16_for(weight):
     """Cached fp16 copy of the frozen fp32 lm_head weight (our cast kernel)."""
-    key = (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
+    key = _weight_key(weight)
     if _W16["key"] == key:
         return _W16["tensor"]
     numel = weight.numel()
@@ -205,7 +243,8 @@ class CKHeadHook:
 
 def _engage_head_ok(weight, V, K):
     return bool(
-        weight.is_cuda
+        (weight.is_cuda or (weight.device.type == "cpu"
+                           and _W16["key"] == _weight_key(weight)))
         and weight.dtype == torch.float32
         and weight.is_contiguous()
         and not weight.requires_grad

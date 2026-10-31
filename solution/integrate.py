@@ -172,6 +172,7 @@ def _ck_causal_forward(
     from transformers.modeling_outputs import CausalLMOutputWithPast
 
     if labels is None or not torch.is_grad_enabled():
+        ck_head.restore_frozen_head(self)
         return self._ck_orig_forward(
             input_ids=input_ids, attention_mask=attention_mask,
             position_ids=position_ids, past_key_values=past_key_values,
@@ -179,6 +180,7 @@ def _ck_causal_forward(
             logits_to_keep=logits_to_keep, output_attentions=output_attentions,
             output_hidden_states=output_hidden_states, return_dict=return_dict,
         )
+    ck_head.offload_frozen_head(self)
     outputs = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -205,6 +207,7 @@ def _ck_causal_forward(
         loss, step = None, None
     logits = None
     if loss is None:  # our guards said no: stock logits path, stock metrics
+        ck_head.restore_frozen_head(self)
         logits = self.lm_head(hidden)
         loss = self.loss_function(
             logits=logits, labels=labels, vocab_size=self.config.vocab_size,
@@ -256,6 +259,7 @@ def engage(model):
         hook = ck_head.CKHeadHook()
         hook.causal_lm = lm
         hook.orig_forward = lm.forward
+        lm._ck_orig_forward = hook.orig_forward
         lm.forward = types.MethodType(_ck_causal_forward, lm)
         _ACTIVE = hook
         print("[ck] engage: OK", flush=True)
@@ -274,6 +278,8 @@ def disengage():
         return
     try:
         if hook.causal_lm is not None and hook.orig_forward is not None:
+            from . import ck_head
+            ck_head.restore_frozen_head(hook.causal_lm)
             hook.causal_lm.forward = hook.orig_forward
     except Exception:
         pass
