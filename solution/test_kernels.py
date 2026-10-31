@@ -247,7 +247,12 @@ def test_head_loss_matches_reference(amp_scale):
 
     tol = 1e-3 if ref_loss_v < 2 else 2e-3
     assert abs(float(loss.detach().item()) - ref_loss_v) <= 3e-3 * max(1, ref_loss_v)
-    torch.testing.assert_close(ho.grad, ref_dh, rtol=2e-2, atol=2e-2)
+    # An absolute error bound must have the same units with and without AMP.
+    # Compare d(loss)/d(hidden), not d(65536*loss)/d(hidden). The 2e-3 bound
+    # is stricter than the previous unit-scale bound (2e-2 / 3).
+    assert torch.isfinite(ho.grad).all()
+    torch.testing.assert_close(ho.grad.float() / upstream, ref_dh.float() / upstream,
+                               rtol=2e-2, atol=2e-3)
     assert step is not None
     tl = step.token_loss
     assert tl.shape == (B, S)
