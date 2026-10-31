@@ -273,6 +273,11 @@ def engage(model):
             print("[ck] engage: skip (V%128 or K%64)", flush=True)
             return None
         hook = ck_head.CKHeadHook()
+        from .ck_compile import prepare_kernels
+        try:
+            prepare_kernels(lm)
+        except Exception as exc:
+            print(f"[ck] compiler preparation fallback: {type(exc).__name__}", flush=True)
         from . import ck_nf4
         ck_nf4.register_mlp_cache(lm)
         hook.causal_lm = lm
